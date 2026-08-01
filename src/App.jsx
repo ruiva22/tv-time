@@ -67,14 +67,32 @@ const CATALOG = [
     id: slug(title), title, genre, year, type: "movie", runtime,
   })),
 ];
-const byId = Object.fromEntries(CATALOG.map((t) => [t.id, t]));
+const catalogById = Object.fromEntries(CATALOG.map((t) => [t.id, t]));
+
+/* Resolve a title id to its display fields. Seed catalog first, then the
+   snapshot stored alongside the tracking entry (for titles added via search). */
+function resolveTitle(id, data) {
+  return catalogById[id] || data?.titles?.[id] || null;
+}
 
 /* deterministic poster gradient from title */
 function gradient(str) {
   let h = 0;
-  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) % 360;
+  for (let i = 0; i < (str || "").length; i++) h = (h * 31 + str.charCodeAt(i)) % 360;
   const h2 = (h + 48) % 360;
   return `linear-gradient(150deg, hsl(${h} 42% 26%), hsl(${h2} 38% 14%))`;
+}
+
+/* Poster: real TMDB image when we have one, deterministic gradient otherwise.
+   className extends .cs-poster (e.g. "sm"); children render on top (badges). */
+function Poster({ title, poster, className = "", children }) {
+  return (
+    <div className={"cs-poster " + className} style={{ background: gradient(title) }}>
+      {poster && <img className="cs-posterimg" src={poster} alt="" loading="lazy" />}
+      <span>{title}</span>
+      {children}
+    </div>
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -83,6 +101,7 @@ function gradient(str) {
 const KEY = "cs_tracker_v1";
 const defaultData = {
   tracking: {},            // id -> { status, rating, progress, addedAt, watchedAt }
+  titles: {},              // id -> { id, title, type, year, genre, poster, seasons, episodes, runtime }  (snapshots for searched titles)
   lists: [],               // { id, name, itemIds: [] }
   profile: { username: "you", following: 42, followers: 128, comments: 17 },
 };
@@ -184,7 +203,7 @@ export default function App() {
   };
 
   const setProgress = (id, val) => {
-    const show = byId[id];
+    const show = resolveTitle(id, data);
     const total = show?.episodes || 1;
     const p = Math.max(0, Math.min(total, val));
     const cur = data.tracking[id] || {};
@@ -208,12 +227,32 @@ export default function App() {
           : { ...l, itemIds: l.itemIds.includes(itemId) ? l.itemIds.filter((x) => x !== itemId) : [...l.itemIds, itemId] }),
     }));
 
+  // Store a title's display snapshot so it renders everywhere without a
+  // live lookup. Called when opening/adding a searched (TMDB) title.
+  const saveTitleSnapshot = (t) =>
+    setData((d) => (d.titles[t.id] ? d : { ...d, titles: { ...d.titles, [t.id]: t } }));
+
+  // Tap a search result: fetch full detail (genre + counts), snapshot it,
+  // then open the detail sheet.
+  const openSearchResult = async (card) => {
+    // Snapshot the light card immediately so the sheet can render at once.
+    saveTitleSnapshot(card);
+    setOpenId(card.id);
+    try {
+      const res = await fetch(`/api/title/${card.type}/${card.id}`);
+      if (res.ok) {
+        const full = await res.json();
+        setData((d) => ({ ...d, titles: { ...d.titles, [full.id]: { ...card, ...full } } }));
+      }
+    } catch { /* keep the light snapshot if detail fetch fails */ }
+  };
+
   if (!configured) return <Gate><Setup /></Gate>;
   if (!authReady) return <div className="cs-root cs-boot"><style>{CSS}</style>Loading…</div>;
   if (!user) return <Gate><SignIn onSignIn={() => signIn().catch(() => notify("Sign-in failed — try again", "err"))} /></Gate>;
   if (!ready) return <div className="cs-root cs-boot"><style>{CSS}</style>Loading your library…</div>;
 
-  const openTitle = openId ? byId[openId] : null;
+  const openTitle = openId ? resolveTitle(openId, data) : null;
 
   return (
     <div className="cs-root">
@@ -226,7 +265,7 @@ export default function App() {
         {tab === "movies" && (
           <Library type="movie" data={data} onOpen={setOpenId} goExplore={() => setTab("explore")} />
         )}
-        {tab === "explore" && <Explore data={data} onOpen={setOpenId} />}
+        {tab === "explore" && <Explore data={data} onOpen={setOpenId} onOpenSearch={openSearchResult} />}
         {tab === "profile" && (
           <Profile data={data} user={user} onOpen={setOpenId} onCreateList={createList}
             onDeleteList={deleteList} notify={notify}
@@ -292,8 +331,8 @@ function Library({ type, data, onOpen, goExplore }) {
 
   const items = useMemo(() => {
     return Object.entries(data.tracking)
-      .filter(([id, e]) => byId[id]?.type === type && e.status === f)
-      .map(([id, e]) => ({ ...byId[id], ...e }))
+      .filter(([id, e]) => resolveTitle(id, data)?.type === type && e.status === f)
+      .map(([id, e]) => ({ ...resolveTitle(id, data), ...e }))
       .sort((a, b) => (b.watchedAt || b.addedAt || 0) - (a.watchedAt || a.addedAt || 0));
   }, [data, type, f]);
 
@@ -302,7 +341,7 @@ function Library({ type, data, onOpen, goExplore }) {
       <Header title={type === "show" ? "Shows" : "Movies"} />
       <div className="cs-tabs">
         {filters.map(([id, label]) => {
-          const n = Object.entries(data.tracking).filter(([tid, e]) => byId[tid]?.type === type && e.status === id).length;
+          const n = Object.entries(data.tracking).filter(([tid, e]) => resolveTitle(tid, data)?.type === type && e.status === id).length;
           return (
             <button key={id} className={"cs-chip" + (f === id ? " on" : "")} onClick={() => setF(id)}>
               {label} <em>{n}</em>
@@ -334,9 +373,7 @@ function Row({ item, onOpen }) {
   const pct = item.type === "show" ? Math.round(((item.progress || 0) / total) * 100) : null;
   return (
     <button className="cs-row" onClick={onOpen}>
-      <div className="cs-poster sm" style={{ background: gradient(item.title) }}>
-        <span>{item.title}</span>
-      </div>
+      <Poster title={item.title} poster={item.poster} className="sm" />
       <div className="cs-rowmeta">
         <div className="cs-rowtitle">{item.title}</div>
         <div className="cs-rowsub">{item.genre} · {item.year}</div>
@@ -363,50 +400,73 @@ function Row({ item, onOpen }) {
 /* ------------------------------------------------------------------ */
 /*  Explore                                                            */
 /* ------------------------------------------------------------------ */
-function Explore({ data, onOpen }) {
+function Explore({ data, onOpen, onOpenSearch }) {
   const [q, setQ] = useState("");
-  const [g, setG] = useState("All");
-  const genres = useMemo(() => ["All", ...Array.from(new Set(CATALOG.map((t) => t.genre))).sort()], []);
-  const results = useMemo(() => {
-    const query = q.trim().toLowerCase();
-    return CATALOG.filter((t) =>
-      (g === "All" || t.genre === g) &&
-      (!query || t.title.toLowerCase().includes(query))
-    );
-  }, [q, g]);
+  const [results, setResults] = useState([]);
+  const [status, setStatus] = useState("idle"); // idle | loading | done | error
+  const debounce = useRef(null);
+  const seq = useRef(0);
+
+  // Debounced live search against the backend TMDB proxy.
+  useEffect(() => {
+    const query = q.trim();
+    clearTimeout(debounce.current);
+    if (!query) { setResults([]); setStatus("idle"); return; }
+    setStatus("loading");
+    debounce.current = setTimeout(async () => {
+      const mine = ++seq.current;
+      try {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+        const json = await res.json();
+        if (mine !== seq.current) return; // a newer query superseded this one
+        setResults(json.results || []);
+        setStatus("done");
+      } catch {
+        if (mine !== seq.current) return;
+        setStatus("error");
+      }
+    }, 350);
+    return () => clearTimeout(debounce.current);
+  }, [q]);
 
   return (
     <>
       <Header title="Explore" />
       <div className="cs-searchwrap">
         <Search size={18} className="cs-dim" />
-        <input className="cs-search" placeholder="Search shows and movies"
-          value={q} onChange={(e) => setQ(e.target.value)} />
+        <input className="cs-search" placeholder="Search any show or movie"
+          value={q} onChange={(e) => setQ(e.target.value)} autoFocus />
         {q && <button className="cs-clear" onClick={() => setQ("")}><X size={16} /></button>}
       </div>
-      <div className="cs-tabs">
-        {genres.map((gn) => (
-          <button key={gn} className={"cs-chip" + (g === gn ? " on" : "")} onClick={() => setG(gn)}>{gn}</button>
-        ))}
-      </div>
+
       <div className="cs-body">
-        <div className="cs-grid">
-          {results.map((t) => {
-            const tracked = data.tracking[t.id];
-            return (
-              <button key={t.id} className="cs-gcard" onClick={() => onOpen(t.id)}>
-                <div className="cs-poster" style={{ background: gradient(t.title) }}>
-                  <span>{t.title}</span>
-                  {tracked && <div className="cs-badge">{tracked.status === "watched" ? "✓" : tracked.status === "watching" ? "▸" : "+"}</div>}
-                </div>
-                <div className="cs-gtitle">{t.title}</div>
-                <div className="cs-gsub">{t.type === "show" ? "TV" : "Film"} · {t.year}</div>
-              </button>
-            );
-          })}
-        </div>
-        {results.length === 0 && (
-          <Empty icon={<Search size={26} />} head="No matches" sub="Try a different title or genre." />
+        {status === "loading" && <div className="cs-searchnote">Searching…</div>}
+        {status === "error" && <div className="cs-searchnote">Search failed — check your connection.</div>}
+
+        {status === "done" && results.length > 0 && (
+          <div className="cs-grid">
+            {results.map((t) => {
+              // A searched result may already be tracked (by its TMDB id).
+              const tracked = data.tracking[t.id];
+              return (
+                <button key={t.type + t.id} className="cs-gcard" onClick={() => onOpenSearch(t)}>
+                  <Poster title={t.title} poster={t.poster}>
+                    {tracked && <div className="cs-badge">{tracked.status === "watched" ? "✓" : tracked.status === "watching" ? "▸" : "+"}</div>}
+                  </Poster>
+                  <div className="cs-gtitle">{t.title}</div>
+                  <div className="cs-gsub">{t.type === "show" ? "TV" : "Film"}{t.year ? " · " + t.year : ""}</div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {status === "done" && results.length === 0 && (
+          <Empty icon={<Search size={26} />} head="No matches" sub="Try a different title." />
+        )}
+        {status === "idle" && (
+          <Empty icon={<Search size={26} />} head="Search the full catalogue"
+            sub="Find any show or film and add it to your library." />
         )}
       </div>
     </>
@@ -422,7 +482,7 @@ function Profile({ data, user, onOpen, onCreateList, onDeleteList, notify, onSig
   const [name, setName] = useState("");
 
   const stats = useMemo(() => {
-    const entries = Object.entries(data.tracking).map(([id, e]) => ({ ...byId[id], ...e }));
+    const entries = Object.entries(data.tracking).map(([id, e]) => ({ ...resolveTitle(id, data), ...e }));
     const showsWatched = entries.filter((e) => e.type === "show" && e.status === "watched").length;
     const showsWatching = entries.filter((e) => e.type === "show" && e.status === "watching").length;
     const moviesWatched = entries.filter((e) => e.type === "movie" && e.status === "watched").length;
@@ -516,7 +576,7 @@ function Profile({ data, user, onOpen, onCreateList, onDeleteList, notify, onSig
               <div key={l.id} className="cs-listrow">
                 <div className="cs-listmini">
                   {l.itemIds.slice(0, 3).map((id) => (
-                    <span key={id} style={{ background: gradient(byId[id]?.title || id) }} />
+                    <span key={id} style={{ background: gradient(resolveTitle(id, data)?.title || id) }} />
                   ))}
                   {l.itemIds.length === 0 && <span className="cs-listminiempty" />}
                 </div>
@@ -549,14 +609,18 @@ function Detail({ title, entry, lists, onClose, onTrack, onUntrack, onRate, onPr
         <button className="cs-close" onClick={onClose}><X size={20} /></button>
 
         <div className="cs-dhero" style={{ background: gradient(title.title) }}>
+          {title.poster && <img className="cs-posterimg" src={title.poster} alt="" />}
           <span>{title.title}</span>
         </div>
 
         <div className="cs-dtitle">{title.title}</div>
         <div className="cs-dmeta">
-          {title.type === "show" ? "TV Series" : "Film"} · {title.genre} · {title.year}
-          {title.type === "show" ? ` · ${title.seasons} ${title.seasons === 1 ? "season" : "seasons"}, ${title.episodes} eps`
-            : ` · ${title.runtime} min`}
+          {title.type === "show" ? "TV Series" : "Film"}
+          {title.genre ? ` · ${title.genre}` : ""}
+          {title.year ? ` · ${title.year}` : ""}
+          {title.type === "show"
+            ? (title.episodes ? ` · ${title.seasons || 1} ${title.seasons === 1 ? "season" : "seasons"}, ${title.episodes} eps` : "")
+            : (title.runtime ? ` · ${title.runtime} min` : "")}
         </div>
 
         {/* status buttons */}
@@ -767,6 +831,9 @@ const CSS = `
 .cs-poster span{ padding:8px; font-size:12px; font-weight:600; line-height:1.15; text-shadow:0 1px 4px rgba(0,0,0,.5); }
 .cs-poster.sm{ width:52px; height:70px; flex:0 0 52px; }
 .cs-poster.sm span{ display:none; }
+.cs-posterimg{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+.cs-poster img + span{ position:relative; z-index:1; }
+.cs-searchnote{ padding:24px 4px; text-align:center; color:#8e8e93; font-size:14px; }
 .cs-badge{ position:absolute; top:5px; right:5px; width:20px; height:20px; border-radius:50%;
   background:var(--acc); color:#000; font-size:12px; font-weight:700; display:flex; align-items:center; justify-content:center; }
 
@@ -851,8 +918,9 @@ const CSS = `
 .cs-grab{ width:38px; height:4px; border-radius:3px; background:#48484a; margin:2px auto 14px; }
 .cs-close{ position:absolute; top:14px; right:16px; background:var(--card2); border:none; color:var(--txt);
   width:32px; height:32px; border-radius:50%; display:flex; align-items:center; justify-content:center; cursor:pointer; z-index:2; }
-.cs-dhero{ height:150px; border-radius:16px; display:flex; align-items:flex-end; padding:16px; margin-bottom:16px; }
-.cs-dhero span{ font-size:20px; font-weight:700; text-shadow:0 2px 8px rgba(0,0,0,.5); }
+.cs-dhero{ position:relative; overflow:hidden; height:180px; border-radius:16px; display:flex; align-items:flex-end; padding:16px; margin-bottom:16px; }
+.cs-dhero span{ position:relative; z-index:1; font-size:20px; font-weight:700; text-shadow:0 2px 8px rgba(0,0,0,.5); }
+.cs-dhero .cs-posterimg{ object-position:center 20%; }
 .cs-dtitle{ font-size:22px; font-weight:700; letter-spacing:-.02em; line-height:1.15; }
 .cs-dtitle.sm{ font-size:19px; margin-bottom:4px; }
 .cs-dmeta{ font-size:13px; color:var(--mut); margin-top:5px; }

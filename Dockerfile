@@ -11,13 +11,20 @@ COPY . .
 RUN npm run build
 
 # ---- serve stage ----
-FROM nginx:1.27-alpine AS runtime
+# Node serves BOTH the built SPA and the /api TMDB proxy, so the API key
+# stays server-side (passed in as TMDB_API_KEY at runtime).
+FROM node:20-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+ENV PORT=3000
 
-# SPA-aware nginx config (routing fallback + asset caching)
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# Only the production deps needed to run the server.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
-# Ship only the built output
-COPY --from=build /app/dist /usr/share/nginx/html
+# The server and the built assets.
+COPY server.js ./
+COPY --from=build /app/dist ./dist
 
-EXPOSE 80
-CMD ["nginx", "-g", "daemon off;"]
+EXPOSE 3000
+CMD ["node", "server.js"]
