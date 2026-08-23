@@ -109,6 +109,9 @@ const defaultData = {
                             //   kept in sync as eps.length so old UI reading it still works)
   titles: {},              // id -> { id, title, type, year, genre, poster, seasons, episodes, runtime, seasonList }  (snapshots for searched titles)
   lists: [],               // { id, name, itemIds: [] }
+  notifications: [],       // { id, type: "follower"|"newSeason"|"upcoming", text, sub, ts, read, ...target }
+  seenFollowers: {},        // uid -> true, so a follower is only ever notified once
+  seenUpcoming: {},         // "titleId-airDate" -> true, so an air date is only ever notified once
 };
 
 /* ------------------------------------------------------------------ */
@@ -126,6 +129,7 @@ export default function App() {
   const [authReady, setAuthReady] = useState(false);
   const [viewUser, setViewUser] = useState(null);   // { uid, name, photo } — someone else's profile, opened from Feed/follow lists
   const [followList, setFollowList] = useState(null); // { uid, mode: "following" | "followers" }
+  const [showNotifications, setShowNotifications] = useState(false);
   const toastTimer = useRef(null);
   const isRemote = useRef(false);                    // guards write-back on remote updates
 
@@ -191,27 +195,43 @@ export default function App() {
     setDoc(doc(db, "trackers", user.uid), data).catch(() => {});
   }, [data, ready, user]);
 
-  // New-season detection: once per session, right after the library loads,
-  // re-check every finished (status "watched") show with a real TMDB id.
-  // If TMDB now has a next_episode_to_air beyond the season count we knew
-  // about, the show is back — move it to Watching (past progress stays as
-  // it was) and flag it so the library row can call it out until opened.
+  // Prepend one notification (newest first), capped so the stored doc
+  // doesn't grow forever.
+  const pushNotification = (n) =>
+    setData((d) => ({
+      ...d,
+      notifications: [{ id: n.id, read: false, ts: Date.now(), ...n }, ...d.notifications].slice(0, 30),
+    }));
+
+  // New-season detection + upcoming-episode reminders: once per session,
+  // right after the library loads, re-check every tracked show with a real
+  // TMDB id (watched or watching) against TMDB's next_episode_to_air.
+  // - Watched shows whose next season is beyond what we knew about move
+  //   back to Watching (past progress untouched) and get called out.
+  // - Any show with an episode airing today/tomorrow gets a one-time
+  //   reminder (deduped by title+air date, so it never repeats).
   useEffect(() => {
     if (!ready || !user) return;
     let cancelled = false;
     (async () => {
-      const finishedShowIds = Object.entries(data.tracking)
-        .filter(([id, e]) => e.status === "watched" && /^\d+$/.test(String(id)))
+      const candidateIds = Object.entries(data.tracking)
+        .filter(([id, e]) => (e.status === "watched" || e.status === "watching") && /^\d+$/.test(String(id)))
         .map(([id]) => id);
-      for (const id of finishedShowIds) {
+      const in2Days = new Date(); in2Days.setDate(in2Days.getDate() + 2);
+      const in2DaysISO = in2Days.toISOString().slice(0, 10);
+      const todayISO = new Date().toISOString().slice(0, 10);
+
+      for (const id of candidateIds) {
         if (cancelled) return;
         try {
           const res = await fetch(`/api/title/show/${id}`);
           if (!res.ok) continue;
           const full = await res.json();
           const next = full.nextEpisodeToAir;
+          const wasWatched = data.tracking[id]?.status === "watched";
           const knownSeasons = resolveTitle(id, data)?.seasons || 0;
-          if (next && next.season > knownSeasons) {
+
+          if (wasWatched && next && next.season > knownSeasons) {
             setData((d) => {
               const cur = d.tracking[id];
               if (!cur || cur.status !== "watched") return d; // already moved elsewhere
@@ -222,13 +242,64 @@ export default function App() {
               };
             });
             notify(`${full.title} is back — Season ${next.season} just started. Moved to Watching.`);
+            pushNotification({
+              id: `newSeason-${id}-${next.season}`, type: "newSeason", titleId: id,
+              text: `${full.title} is back`, sub: `Season ${next.season} just started`,
+            });
           } else if (next) {
-            // No season bump, but keep nextEpisodeToAir fresh so an
-            // already-Watching show's "Next episode" line stays accurate.
+            // No season bump, but keep nextEpisodeToAir fresh so the
+            // "Next episode" line stays accurate.
             setData((d) => ({ ...d, titles: { ...d.titles, [id]: { ...resolveTitle(id, d), ...full } } }));
+          }
+
+          if (next?.airDate && next.airDate >= todayISO && next.airDate <= in2DaysISO) {
+            const seenKey = `${id}-${next.airDate}`;
+            if (!data.seenUpcoming[seenKey]) {
+              setData((d) => ({ ...d, seenUpcoming: { ...d.seenUpcoming, [seenKey]: true } }));
+              pushNotification({
+                id: `upcoming-${seenKey}`, type: "upcoming", titleId: id,
+                text: `${full.title} — new episode ${next.airDate === todayISO ? "today" : "tomorrow"}`,
+                sub: `Season ${next.season}, Episode ${next.episode}`,
+              });
+            }
           }
         } catch { /* skip this show; it's retried next session */ }
       }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready, user]);
+
+  // New-follower detection: once per session, compare who follows you now
+  // against who you were last notified about.
+  useEffect(() => {
+    if (!ready || !user || !configured) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const snap = await getDocs(query(collection(db, "follows"), where("followeeUid", "==", user.uid)));
+        const newFollowerUids = snap.docs
+          .map((d) => d.data().followerUid)
+          .filter((uid) => uid && !data.seenFollowers[uid]);
+        if (!newFollowerUids.length) return;
+        for (const uid of newFollowerUids) {
+          if (cancelled) return;
+          let profile = { uid, name: "Someone", photo: null };
+          try {
+            const udoc = await getDoc(doc(db, "users", uid));
+            if (udoc.exists()) profile = { uid, ...udoc.data() };
+          } catch { /* fall back to "Someone" */ }
+          pushNotification({
+            id: `follower-${uid}`, type: "follower", uid: profile.uid, name: profile.name, photo: profile.photo,
+            text: `${profile.name} started following you`,
+          });
+        }
+        setData((d) => {
+          const seen = { ...d.seenFollowers };
+          newFollowerUids.forEach((uid) => { seen[uid] = true; });
+          return { ...d, seenFollowers: seen };
+        });
+      } catch { /* rules not deployed yet, or offline — retried next session */ }
     })();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -242,6 +313,18 @@ export default function App() {
       const { newSeason, ...rest } = cur;
       return { ...d, tracking: { ...d.tracking, [id]: rest } };
     });
+
+  const markNotificationsRead = () =>
+    setData((d) => ({ ...d, notifications: d.notifications.map((n) => ({ ...n, read: true })) }));
+
+  // Tap a notification: mark it read, close the panel, and jump to whatever
+  // it's about.
+  const openNotification = (n) => {
+    setData((d) => ({ ...d, notifications: d.notifications.map((x) => x.id === n.id ? { ...x, read: true } : x) }));
+    setShowNotifications(false);
+    if (n.type === "follower") openUserProfile({ uid: n.uid, name: n.name, photo: n.photo });
+    else if (n.titleId) openTitleId(n.titleId);
+  };
 
   /* --- mutations --- */
   const setEntry = (id, patch) =>
@@ -413,6 +496,7 @@ export default function App() {
   if (!ready) return <div className="cs-root cs-boot"><style>{CSS}</style>Loading your library…</div>;
 
   const openTitle = openId ? resolveTitle(openId, data) : null;
+  const unreadCount = data.notifications.filter((n) => !n.read).length;
 
   return (
     <div className="cs-root">
@@ -420,20 +504,37 @@ export default function App() {
 
       <div className="cs-screen">
         {tab === "shows" && (
-          <Library type="show" data={data} onOpen={openTitleId} goExplore={() => setTab("explore")} />
+          <Library type="show" data={data} onOpen={openTitleId} goExplore={() => setTab("explore")}
+            unread={unreadCount} onBell={() => setShowNotifications(true)} />
         )}
         {tab === "movies" && (
-          <Library type="movie" data={data} onOpen={openTitleId} goExplore={() => setTab("explore")} />
+          <Library type="movie" data={data} onOpen={openTitleId} goExplore={() => setTab("explore")}
+            unread={unreadCount} onBell={() => setShowNotifications(true)} />
         )}
-        {tab === "feed" && <Feed onOpenUser={openUserProfile} />}
-        {tab === "explore" && <Explore data={data} onOpen={setOpenId} onOpenSearch={openSearchResult} />}
+        {tab === "feed" && (
+          <Feed onOpenUser={openUserProfile} unread={unreadCount} onBell={() => setShowNotifications(true)} />
+        )}
+        {tab === "explore" && (
+          <Explore data={data} onOpen={setOpenId} onOpenSearch={openSearchResult}
+            unread={unreadCount} onBell={() => setShowNotifications(true)} />
+        )}
         {tab === "profile" && (
           <Profile data={data} user={user} onOpen={openTitleId} onOpenSearch={openSearchResult}
             onCreateList={createList} onDeleteList={deleteList} notify={notify}
             onOpenFollowList={(mode) => setFollowList({ uid: user.uid, mode })}
+            unread={unreadCount} onBell={() => setShowNotifications(true)}
             onSignOut={() => { logOut(); notify("Signed out"); }} />
         )}
       </div>
+
+      {showNotifications && (
+        <NotificationsPanel
+          items={data.notifications}
+          onClose={() => setShowNotifications(false)}
+          onMarkAllRead={markNotificationsRead}
+          onOpen={openNotification}
+        />
+      )}
 
       {/* toast — styled after the app's inline banner */}
       {toast && (
@@ -516,7 +617,7 @@ export default function App() {
 const SHOW_FILTERS = [["watching", "Watching"], ["want", "Watchlist"], ["watched", "Watched"]];
 const MOVIE_FILTERS = [["want", "Watchlist"], ["watched", "Watched"]];
 
-function Library({ type, data, onOpen, goExplore }) {
+function Library({ type, data, onOpen, goExplore, unread, onBell }) {
   const filters = type === "show" ? SHOW_FILTERS : MOVIE_FILTERS;
   const [f, setF] = useState(filters[0][0]);
 
@@ -529,7 +630,7 @@ function Library({ type, data, onOpen, goExplore }) {
 
   return (
     <>
-      <Header title={type === "show" ? "Shows" : "Movies"} />
+      <Header title={type === "show" ? "Shows" : "Movies"} unread={unread} onBell={onBell} />
       <div className="cs-tabs">
         {filters.map(([id, label]) => {
           const n = Object.entries(data.tracking).filter(([tid, e]) => resolveTitle(tid, data)?.type === type && e.status === id).length;
@@ -595,7 +696,7 @@ function Row({ item, onOpen }) {
 /* ------------------------------------------------------------------ */
 /*  Explore                                                            */
 /* ------------------------------------------------------------------ */
-function Explore({ data, onOpen, onOpenSearch }) {
+function Explore({ data, onOpen, onOpenSearch, unread, onBell }) {
   const [q, setQ] = useState("");
   const [results, setResults] = useState([]);
   const [status, setStatus] = useState("idle"); // idle | loading | done | error
@@ -670,7 +771,7 @@ function Explore({ data, onOpen, onOpenSearch }) {
 
   return (
     <>
-      <Header title="Explore" />
+      <Header title="Explore" unread={unread} onBell={onBell} />
       <div className="cs-searchwrap">
         <Search size={18} className="cs-dim" />
         <input className="cs-search" placeholder="Search any show or movie"
@@ -732,7 +833,7 @@ function TitleCard({ t, tracked, onOpen }) {
 /* ------------------------------------------------------------------ */
 const ACTION_VERB = { watched: "finished", watching: "started watching", want: "added to their watchlist" };
 
-function Feed({ onOpenUser }) {
+function Feed({ onOpenUser, unread, onBell }) {
   const [items, setItems] = useState([]);
   const [ready, setReady] = useState(false);
   const [errored, setErrored] = useState(false);
@@ -753,7 +854,7 @@ function Feed({ onOpenUser }) {
 
   return (
     <>
-      <Header title="Feed" />
+      <Header title="Feed" unread={unread} onBell={onBell} />
       <div className="cs-body">
         {!ready && <div className="cs-searchnote">Loading…</div>}
         {ready && errored && (
@@ -969,6 +1070,51 @@ function FollowList({ uid, mode, myUid, onClose, onOpenUser }) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Notifications — new followers, new seasons, upcoming episodes      */
+/* ------------------------------------------------------------------ */
+const NOTIF_ICON = { follower: User, newSeason: Tv, upcoming: Clock };
+
+function NotificationsPanel({ items, onClose, onMarkAllRead, onOpen }) {
+  const hasUnread = items.some((n) => !n.read);
+  return (
+    <div className="cs-modal" onClick={onClose}>
+      <div className="cs-sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="cs-grab" />
+        <button className="cs-close" onClick={onClose}><X size={20} /></button>
+        <div className="cs-notifhead">
+          <div className="cs-dtitle sm">Notifications</div>
+          {hasUnread && <button className="cs-notifclear" onClick={onMarkAllRead}>Mark all read</button>}
+        </div>
+
+        {items.length === 0 && (
+          <Empty icon={<Bell size={26} />} head="Nothing yet"
+            sub="New followers, new seasons, and upcoming episodes will show up here." />
+        )}
+
+        {items.length > 0 && (
+          <div className="cs-notiflist">
+            {items.map((n) => {
+              const Icon = NOTIF_ICON[n.type] || Bell;
+              return (
+                <button key={n.id} className={"cs-notifrow" + (n.read ? "" : " unread")} onClick={() => onOpen(n)}>
+                  <div className="cs-notificon"><Icon size={17} /></div>
+                  <div className="cs-notifmeta">
+                    <div className="cs-notiftext">{n.text}</div>
+                    {n.sub && <div className="cs-notifsub">{n.sub}</div>}
+                    <div className="cs-notiftime">{timeAgo(n.ts)}</div>
+                  </div>
+                  {!n.read && <div className="cs-notifdot" />}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /*  Shelf — horizontal scroll row of posters (Profile's taste sections) */
 /* ------------------------------------------------------------------ */
 function Shelf({ label, note, sub, items, onOpen, rated }) {
@@ -995,7 +1141,7 @@ function Shelf({ label, note, sub, items, onOpen, rated }) {
 /* ------------------------------------------------------------------ */
 /*  Profile  (closely mirrors the reference screen)                    */
 /* ------------------------------------------------------------------ */
-function Profile({ data, user, onOpen, onOpenSearch, onCreateList, onDeleteList, notify, onOpenFollowList, onSignOut }) {
+function Profile({ data, user, onOpen, onOpenSearch, onCreateList, onDeleteList, notify, onOpenFollowList, unread, onBell, onSignOut }) {
   const [showNew, setShowNew] = useState(false);
   const [menu, setMenu] = useState(false);
   const [name, setName] = useState("");
@@ -1084,7 +1230,10 @@ function Profile({ data, user, onOpen, onOpenSearch, onCreateList, onDeleteList,
   return (
     <div className="cs-profile">
       <div className="cs-phead">
-        <div className="cs-bell"><Bell size={20} fill="#000" color="#000" /></div>
+        <button className="cs-bell" onClick={onBell}>
+          <Bell size={20} fill="#000" color="#000" />
+          {unread > 0 && <span className="cs-bellbadge">{unread > 9 ? "9+" : unread}</span>}
+        </button>
         <div className="cs-menuwrap">
           <button className="cs-iconbtn" onClick={() => setMenu((v) => !v)}>
             <MoreHorizontal size={22} className="cs-dim" />
@@ -1478,9 +1627,12 @@ function ListPicker({ itemId, lists, onToggle, onCreate, onClose }) {
 /* ------------------------------------------------------------------ */
 /*  Shared bits                                                        */
 /* ------------------------------------------------------------------ */
-const Header = ({ title }) => (
+const Header = ({ title, unread, onBell }) => (
   <div className="cs-header">
-    <div className="cs-bell sm"><Bell size={17} fill="#000" color="#000" /></div>
+    <button className="cs-bell sm" onClick={onBell}>
+      <Bell size={17} fill="#000" color="#000" />
+      {unread > 0 && <span className="cs-bellbadge">{unread > 9 ? "9+" : unread}</span>}
+    </button>
     <h1>{title}</h1>
     <MoreHorizontal size={22} className="cs-dim" />
   </div>
@@ -1562,8 +1714,13 @@ const CSS = `
 /* header */
 .cs-header{ display:flex; align-items:center; gap:14px; padding:18px 20px 8px; }
 .cs-header h1{ flex:1; margin:0; font-size:26px; font-weight:700; letter-spacing:-.02em; }
-.cs-bell{ width:34px; height:34px; border-radius:50%; background:var(--acc); display:flex; align-items:center; justify-content:center; }
+.cs-bell{ width:34px; height:34px; border-radius:50%; background:var(--acc); display:flex; align-items:center; justify-content:center;
+  border:none; padding:0; position:relative; flex:0 0 auto; }
+button.cs-bell{ cursor:pointer; }
 .cs-bell.sm{ width:30px; height:30px; }
+.cs-bellbadge{ position:absolute; top:-3px; right:-3px; min-width:16px; height:16px; padding:0 3px; border-radius:99px;
+  background:#e24b4a; color:#fff; font-size:9.5px; font-weight:700; display:flex; align-items:center; justify-content:center;
+  border:2px solid var(--bg); line-height:1; }
 
 /* filter chips */
 .cs-tabs{ display:flex; gap:8px; padding:6px 20px 12px; overflow-x:auto; scrollbar-width:none; }
@@ -1663,6 +1820,21 @@ const CSS = `
   color:var(--txt); padding:12px 2px; font-size:15px; font-family:inherit; cursor:pointer; border-bottom:1px solid var(--line); }
 .cs-followrow:last-child{ border-bottom:none; }
 .cs-followname{ flex:1; font-weight:600; }
+
+/* notifications */
+.cs-notifhead{ display:flex; align-items:baseline; justify-content:space-between; margin-bottom:8px; padding-right:42px; }
+.cs-notifclear{ background:none; border:none; color:var(--acc); font-size:12.5px; font-weight:600; cursor:pointer; font-family:inherit; padding:0; }
+.cs-notiflist{ display:flex; flex-direction:column; gap:9px; margin-top:6px; padding-bottom:10px; }
+.cs-notifrow{ display:flex; align-items:flex-start; gap:12px; width:100%; text-align:left; background:var(--card);
+  border:none; border-radius:14px; padding:12px; cursor:pointer; font-family:inherit; color:var(--txt); }
+.cs-notifrow.unread{ background:#20240f; }
+.cs-notificon{ flex:0 0 34px; width:34px; height:34px; border-radius:50%; background:var(--card2);
+  display:flex; align-items:center; justify-content:center; color:var(--acc); }
+.cs-notifmeta{ flex:1; min-width:0; }
+.cs-notiftext{ font-size:13.5px; font-weight:600; line-height:1.35; }
+.cs-notifsub{ font-size:12px; color:var(--mut); margin-top:2px; }
+.cs-notiftime{ font-size:11px; color:var(--mut); margin-top:5px; }
+.cs-notifdot{ flex:0 0 auto; width:8px; height:8px; border-radius:50%; background:var(--acc); margin-top:4px; }
 
 /* empty */
 .cs-empty{ text-align:center; padding:48px 24px; }

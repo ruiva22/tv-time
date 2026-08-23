@@ -129,6 +129,12 @@ Sign-in automatically. `firebase.json` already serves `dist/` as a single-page a
   until you open it. The episode picker also splits any season's episodes into
   released (as before) and a dimmed "Upcoming" group for ones with no air date yet or
   a future one — nothing to mark watched there, so no checkbox.
+- The bell icon is a real notification center. Once per session it checks: who's
+  newly followed you (`follows` compared against a locally-stored "seen" set), which
+  Watched shows just got a new season, and which Watching shows have an episode
+  airing today/tomorrow (both from the same `next_episode_to_air` check above) — each
+  becomes one entry, deduplicated so nothing repeats across sessions. Tapping one
+  marks it read and jumps to whatever it's about (a profile or a title).
 
 ## Project structure
 
