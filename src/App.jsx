@@ -1552,8 +1552,11 @@ const CSS = `
   font-family:'Poppins', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   display:flex; flex-direction:column; overflow:hidden;
 }
-.cs-boot{ align-items:center; justify-content:center; color:var(--mut); font-size:14px; }
-.cs-screen{ flex:1; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:touch; }
+.cs-boot{ align-items:center; justify-content:center; color:var(--mut); font-size:14px; padding-top:env(safe-area-inset-top); }
+/* viewport-fit=cover lets the black background run edge-to-edge under the
+   notch/Dynamic Island/status bar; env(safe-area-inset-*) (0 on devices
+   without one) keeps actual content clear of it. */
+.cs-screen{ flex:1; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:touch; padding-top:env(safe-area-inset-top); }
 .cs-dim{ color:var(--dim); }
 
 /* header */
@@ -1721,7 +1724,7 @@ button.cs-socell{ cursor:pointer; }
 
 /* modal + sheet */
 .cs-modal{ position:absolute; inset:0; background:rgba(0,0,0,.6); display:flex; align-items:flex-end;
-  z-index:40; animation:fade .18s ease; }
+  z-index:40; animation:fade .18s ease; padding-top:env(safe-area-inset-top); }
 @keyframes fade{ from{opacity:0} to{opacity:1} }
 .cs-sheet{ width:100%; max-height:90%; overflow-y:auto; background:#141416; border-radius:24px 24px 0 0;
   padding:10px 20px 30px; position:relative; animation:rise .26s cubic-bezier(.2,.8,.2,1); }
@@ -1816,14 +1819,15 @@ button.cs-socell{ cursor:pointer; }
   color:inherit; cursor:pointer; font-family:inherit; }
 
 /* bottom nav */
-.cs-nav{ display:flex; border-top:1px solid var(--line); background:#050505; padding:8px 4px 10px; }
+.cs-nav{ display:flex; border-top:1px solid var(--line); background:#050505; padding:8px 4px calc(10px + env(safe-area-inset-bottom)); }
 .cs-navbtn{ flex:1; background:none; border:none; color:var(--dim); display:flex; flex-direction:column;
   align-items:center; gap:4px; padding:4px; cursor:pointer; font-family:inherit; }
 .cs-navbtn span{ font-size:11px; }
 .cs-navbtn.on{ color:var(--txt); }
 
 /* gate screens (sign-in / setup) */
-.cs-gate{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; padding:32px; }
+.cs-gate{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+  padding:max(32px, env(safe-area-inset-top)) 32px max(32px, env(safe-area-inset-bottom)); }
 .cs-signin{ max-width:340px; text-align:center; }
 .cs-bell.lg{ width:56px; height:56px; margin:0 auto 26px; }
 .cs-signin h1{ font-size:30px; font-weight:700; letter-spacing:-.03em; line-height:1.12; margin:0 0 14px; }
