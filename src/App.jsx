@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   Tv, Clapperboard, Search, User, Bell, MoreHorizontal, ChevronRight, ChevronDown,
-  Star, Plus, Minus, Check, X, Clock, ListPlus, Trash2, Film, ArrowLeft,
+  Star, Plus, Minus, Check, X, Clock, ListPlus, Trash2, Film, ArrowLeft, Rss,
 } from "lucide-react";
 import { db, configured, signIn, logOut, watchAuth } from "./firebase";
-import { doc, onSnapshot, setDoc } from "firebase/firestore";
+import { doc, onSnapshot, setDoc, collection, addDoc, query, orderBy, limit } from "firebase/firestore";
 
 /* ------------------------------------------------------------------ */
 /*  Seed catalog                                                       */
@@ -174,6 +174,24 @@ export default function App() {
       return { ...d, tracking: { ...d.tracking, [id]: next } };
     });
 
+  // Post one event to the shared, cross-user activity feed. Best-effort:
+  // if the `activity` collection's Firestore rules haven't been added yet
+  // (see README.md), this just silently no-ops rather than breaking tracking.
+  const logActivity = (status, title) => {
+    if (!configured || !user || !title) return;
+    addDoc(collection(db, "activity"), {
+      uid: user.uid,
+      name: user.displayName || user.email || "Someone",
+      photo: user.photoURL || null,
+      titleId: title.id,
+      titleName: title.title,
+      titleType: title.type,
+      poster: title.poster || null,
+      action: status, // "want" | "watching" | "watched"
+      createdAt: Date.now(),
+    }).catch(() => {});
+  };
+
   const track = (id, status) => {
     const exists = data.tracking[id];
     const patch = {
@@ -187,6 +205,7 @@ export default function App() {
     if (status === "watched") patch.watchedAt = Date.now();
     else if (exists?.watchedAt) patch.watchedAt = exists.watchedAt;
     setEntry(id, patch);
+    logActivity(status, resolveTitle(id, data));
     const label = status === "want" ? "Added to your watchlist"
       : status === "watching" ? "Marked as watching" : "Marked as watched";
     notify(label);
@@ -325,6 +344,7 @@ export default function App() {
         {tab === "movies" && (
           <Library type="movie" data={data} onOpen={setOpenId} goExplore={() => setTab("explore")} />
         )}
+        {tab === "feed" && <Feed />}
         {tab === "explore" && <Explore data={data} onOpen={setOpenId} onOpenSearch={openSearchResult} />}
         {tab === "profile" && (
           <Profile data={data} user={user} onOpen={setOpenId} onCreateList={createList}
@@ -345,6 +365,7 @@ export default function App() {
         {[
           ["shows", Tv, "Shows"],
           ["movies", Clapperboard, "Movies"],
+          ["feed", Rss, "Feed"],
           ["explore", Search, "Explore"],
           ["profile", User, "Profile"],
         ].map(([id, Icon, label]) => (
@@ -601,6 +622,80 @@ function TitleCard({ t, tracked, onOpen }) {
       <div className="cs-gsub">{t.type === "show" ? "TV" : "Film"}{t.year ? " · " + t.year : ""}</div>
     </button>
   );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Feed — live cross-user activity: everyone's status changes         */
+/* ------------------------------------------------------------------ */
+const ACTION_VERB = { watched: "finished", watching: "started watching", want: "added to their watchlist" };
+
+function Feed() {
+  const [items, setItems] = useState([]);
+  const [ready, setReady] = useState(false);
+  const [errored, setErrored] = useState(false);
+
+  // Shared collection, not per-user — every signed-in user's Watching/
+  // Watchlist/Watched taps land here, and everyone subscribes to the same
+  // live query, newest first.
+  useEffect(() => {
+    if (!configured) { setReady(true); return; }
+    const q = query(collection(db, "activity"), orderBy("createdAt", "desc"), limit(50));
+    const unsub = onSnapshot(
+      q,
+      (snap) => { setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))); setReady(true); setErrored(false); },
+      () => { setErrored(true); setReady(true); }
+    );
+    return unsub;
+  }, []);
+
+  return (
+    <>
+      <Header title="Feed" />
+      <div className="cs-body">
+        {!ready && <div className="cs-searchnote">Loading…</div>}
+        {ready && errored && (
+          <Empty icon={<Rss size={26} />} head="Feed unavailable"
+            sub="The activity collection needs its own Firestore rules — see README.md." />
+        )}
+        {ready && !errored && items.length === 0 && (
+          <Empty icon={<Rss size={26} />} head="No activity yet"
+            sub="Once people track shows and movies, updates show up here in real time." />
+        )}
+        {ready && !errored && items.length > 0 && (
+          <div className="cs-feedlist">
+            {items.map((it) => <FeedRow key={it.id} item={it} />)}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+function FeedRow({ item }) {
+  const verb = ACTION_VERB[item.action] || "updated";
+  return (
+    <div className="cs-feedrow">
+      {item.photo
+        ? <img className="cs-favatar" src={item.photo} alt="" referrerPolicy="no-referrer" />
+        : <div className="cs-favatar">{(item.name || "?").slice(0, 1).toUpperCase()}</div>}
+      <div className="cs-feedmeta">
+        <div className="cs-feedtext"><b>{item.name}</b> {verb} <b>{item.titleName}</b></div>
+        <div className="cs-feedtime">{timeAgo(item.createdAt)}</div>
+      </div>
+      <Poster title={item.titleName} poster={item.poster} className="sm" />
+    </div>
+  );
+}
+
+function timeAgo(ts) {
+  if (!ts) return "";
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + "m ago";
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + "h ago";
+  return Math.floor(h / 24) + "d ago";
 }
 
 /* ------------------------------------------------------------------ */
@@ -1109,6 +1204,16 @@ const CSS = `
   display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
 .cs-gsub{ font-size:11px; color:var(--mut); margin-top:1px; }
 .cs-feedsentinel{ text-align:center; padding:18px 4px 8px; font-size:12.5px; color:var(--mut); }
+
+/* live activity feed */
+.cs-feedlist{ display:flex; flex-direction:column; gap:10px; }
+.cs-feedrow{ display:flex; align-items:center; gap:12px; background:var(--card); border-radius:16px; padding:12px; }
+.cs-favatar{ flex:0 0 38px; width:38px; height:38px; border-radius:50%; background:var(--card2);
+  display:flex; align-items:center; justify-content:center; font-size:15px; font-weight:700; color:var(--acc); object-fit:cover; }
+.cs-feedmeta{ flex:1; min-width:0; }
+.cs-feedtext{ font-size:13.5px; line-height:1.4; color:var(--txt); }
+.cs-feedtext b{ font-weight:600; }
+.cs-feedtime{ font-size:11.5px; color:var(--mut); margin-top:3px; }
 
 /* empty */
 .cs-empty{ text-align:center; padding:48px 24px; }

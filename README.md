@@ -17,8 +17,8 @@ In the [Firebase console](https://console.firebase.google.com):
 3. **Firestore Database ->** create a database (production mode).
 4. Paste your config into `src/firebase.js` (replace the `YOUR_...` placeholders).
 
-Set these Firestore security rules so each person can only read and write their own
-library:
+Set these Firestore security rules — each person can only read and write their own
+library, but everyone signed in can read (and post to) the shared `activity` feed:
 
 ```
 rules_version = '2';
@@ -27,12 +27,31 @@ service cloud.firestore {
     match /trackers/{uid} {
       allow read, write: if request.auth != null && request.auth.uid == uid;
     }
+
+    match /activity/{eventId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasAll(
+             ['uid', 'name', 'titleId', 'titleName', 'titleType', 'action', 'createdAt']
+           )
+        && request.resource.data.action in ['want', 'watching', 'watched'];
+      allow update, delete: if false;
+    }
   }
 }
 ```
 
+The same rules live in `firestore.rules`, so once the Firebase CLI is set up (step 3
+below) you can push rule changes with:
+
+```bash
+firebase deploy --only firestore:rules
+```
+
 > Until you paste a real config in, the app shows a one-time setup screen instead of
-> a blank page.
+> a blank page. The Feed tab shows "Feed unavailable" until the `activity` rules
+> above are in place — the rest of the app works fine either way.
 
 ## 2. Run locally
 
@@ -66,12 +85,17 @@ Sign-in automatically. `firebase.json` already serves `dist/` as a single-page a
   appears on the others without a refresh.
 - Local edits write straight back to the same document; echoes of remote updates are
   ignored to prevent write loops.
+- The **Feed** tab is separate: every time anyone taps Watching / Watchlist / Watched,
+  one event is appended to the shared `activity` collection. All signed-in users
+  subscribe to the same live query (newest 50 first), so it's a real-time feed across
+  everyone's library, not just your own.
 
 ## Project structure
 
 ```
 index.html          # app shell (mobile viewport, full-height root)
-firebase.json       # Hosting config -> serves dist/ as an SPA
+firebase.json       # Hosting config -> serves dist/ as an SPA; points at firestore.rules
+firestore.rules     # security rules for trackers/{uid} and the shared activity feed
 .firebaserc         # your Firebase project alias
 src/
   main.jsx          # React entry
