@@ -44,6 +44,7 @@ if (configured) {
   // syncs writes when it returns; multi-tab manager avoids conflicts.
   db = initializeFirestore(app, {
     localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
+    ignoreUndefinedProperties: true,
   });
   auth = getAuth(app);
 }

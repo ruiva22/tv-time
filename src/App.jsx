@@ -172,13 +172,17 @@ export default function App() {
 
   const track = (id, status) => {
     const exists = data.tracking[id];
-    setEntry(id, {
+    const patch = {
       status,
       addedAt: exists?.addedAt || Date.now(),
       progress: exists?.progress || 0,
       rating: exists?.rating || 0,
-      watchedAt: status === "watched" ? Date.now() : exists?.watchedAt,
-    });
+    };
+    // Only include watchedAt when it actually has a value — Firestore's
+    // setDoc rejects an explicit `undefined` field and crashes the app.
+    if (status === "watched") patch.watchedAt = Date.now();
+    else if (exists?.watchedAt) patch.watchedAt = exists.watchedAt;
+    setEntry(id, patch);
     const label = status === "want" ? "Added to your watchlist"
       : status === "watching" ? "Marked as watching" : "Marked as watched";
     notify(label);
@@ -194,12 +198,14 @@ export default function App() {
   const rate = (id, rating) => {
     const cur = data.tracking[id];
     const status = cur?.status || "watched";
-    setEntry(id, {
+    const patch = {
       rating,
       status,
       addedAt: cur?.addedAt || Date.now(),
-      watchedAt: cur?.watchedAt || (status === "watched" ? Date.now() : undefined),
-    });
+    };
+    const watchedAt = cur?.watchedAt || (status === "watched" ? Date.now() : undefined);
+    if (watchedAt) patch.watchedAt = watchedAt;
+    setEntry(id, patch);
   };
 
   const setProgress = (id, val) => {
@@ -207,12 +213,14 @@ export default function App() {
     const total = show?.episodes || 1;
     const p = Math.max(0, Math.min(total, val));
     const cur = data.tracking[id] || {};
-    setEntry(id, {
+    const patch = {
       progress: p,
       status: p >= total ? "watched" : p > 0 ? "watching" : cur.status || "want",
       addedAt: cur.addedAt || Date.now(),
-      watchedAt: p >= total ? Date.now() : cur.watchedAt,
-    });
+    };
+    const watchedAt = p >= total ? Date.now() : cur.watchedAt;
+    if (watchedAt) patch.watchedAt = watchedAt;
+    setEntry(id, patch);
   };
 
   const createList = (name) =>
