@@ -6,6 +6,7 @@ import {
 import { db, configured, signIn, logOut, watchAuth } from "./firebase";
 import {
   doc, onSnapshot, setDoc, collection, addDoc, query, orderBy, limit, where, getCountFromServer,
+  getDoc, getDocs, deleteDoc,
 } from "firebase/firestore";
 
 /* ------------------------------------------------------------------ */
@@ -123,6 +124,8 @@ export default function App() {
   const [listPick, setListPick] = useState(null);   // id being added to a list
   const [user, setUser] = useState(null);           // signed-in Google user
   const [authReady, setAuthReady] = useState(false);
+  const [viewUser, setViewUser] = useState(null);   // { uid, name, photo } — someone else's profile, opened from Feed/follow lists
+  const [followList, setFollowList] = useState(null); // { uid, mode: "following" | "followers" }
   const toastTimer = useRef(null);
   const isRemote = useRef(false);                    // guards write-back on remote updates
 
@@ -137,6 +140,27 @@ export default function App() {
     if (!configured) { setAuthReady(true); return; }
     return watchAuth((u) => { setUser(u); setAuthReady(true); });
   }, []);
+
+  // Keep a small public directory entry (name + photo) up to date for this
+  // user, so anyone who follows them — or sees them in the feed — can
+  // resolve their uid to a display name even before they've posted any
+  // activity themselves.
+  useEffect(() => {
+    if (!configured || !user) return;
+    setDoc(doc(db, "users", user.uid), {
+      uid: user.uid,
+      name: user.displayName || user.email || "Someone",
+      photo: user.photoURL || null,
+      updatedAt: Date.now(),
+    }, { merge: true }).catch(() => {});
+  }, [user]);
+
+  // Tap a name/avatar anywhere (feed, follow lists): jump to your own
+  // Profile tab for yourself, otherwise open their public profile overlay.
+  const openUserProfile = (u) => {
+    if (u.uid === user.uid) { setViewUser(null); setTab("profile"); }
+    else setViewUser(u);
+  };
 
   // Subscribe to this user's document — live updates from any device.
   useEffect(() => {
@@ -345,11 +369,12 @@ export default function App() {
         {tab === "movies" && (
           <Library type="movie" data={data} onOpen={setOpenId} goExplore={() => setTab("explore")} />
         )}
-        {tab === "feed" && <Feed />}
+        {tab === "feed" && <Feed onOpenUser={openUserProfile} />}
         {tab === "explore" && <Explore data={data} onOpen={setOpenId} onOpenSearch={openSearchResult} />}
         {tab === "profile" && (
           <Profile data={data} user={user} onOpen={setOpenId} onCreateList={createList}
             onDeleteList={deleteList} notify={notify}
+            onOpenFollowList={(mode) => setFollowList({ uid: user.uid, mode })}
             onSignOut={() => { logOut(); notify("Signed out"); }} />
         )}
       </div>
@@ -406,6 +431,23 @@ export default function App() {
           onToggle={(lid) => toggleInList(lid, listPick)}
           onCreate={(name) => createList(name)}
           onClose={() => setListPick(null)}
+        />
+      )}
+
+      {viewUser && (
+        <UserProfile
+          uid={viewUser.uid} name={viewUser.name} photo={viewUser.photo} myUid={user.uid}
+          onClose={() => setViewUser(null)}
+          onOpenFollowList={(uid, mode) => setFollowList({ uid, mode })}
+          onOpenUser={openUserProfile}
+        />
+      )}
+
+      {followList && (
+        <FollowList
+          uid={followList.uid} mode={followList.mode} myUid={user.uid}
+          onClose={() => setFollowList(null)}
+          onOpenUser={(u) => { setFollowList(null); openUserProfile(u); }}
         />
       )}
     </div>
@@ -630,7 +672,7 @@ function TitleCard({ t, tracked, onOpen }) {
 /* ------------------------------------------------------------------ */
 const ACTION_VERB = { watched: "finished", watching: "started watching", want: "added to their watchlist" };
 
-function Feed() {
+function Feed({ onOpenUser }) {
   const [items, setItems] = useState([]);
   const [ready, setReady] = useState(false);
   const [errored, setErrored] = useState(false);
@@ -664,7 +706,7 @@ function Feed() {
         )}
         {ready && !errored && items.length > 0 && (
           <div className="cs-feedlist">
-            {items.map((it) => <FeedRow key={it.id} item={it} />)}
+            {items.map((it) => <FeedRow key={it.id} item={it} onOpenUser={onOpenUser} />)}
           </div>
         )}
       </div>
@@ -672,15 +714,21 @@ function Feed() {
   );
 }
 
-function FeedRow({ item }) {
+function FeedRow({ item, onOpenUser }) {
   const verb = ACTION_VERB[item.action] || "updated";
+  const who = () => onOpenUser?.({ uid: item.uid, name: item.name, photo: item.photo });
   return (
     <div className="cs-feedrow">
-      {item.photo
-        ? <img className="cs-favatar" src={item.photo} alt="" referrerPolicy="no-referrer" />
-        : <div className="cs-favatar">{(item.name || "?").slice(0, 1).toUpperCase()}</div>}
+      <button className="cs-feedavatarbtn" onClick={who} disabled={!onOpenUser}>
+        {item.photo
+          ? <img className="cs-favatar" src={item.photo} alt="" referrerPolicy="no-referrer" />
+          : <div className="cs-favatar">{(item.name || "?").slice(0, 1).toUpperCase()}</div>}
+      </button>
       <div className="cs-feedmeta">
-        <div className="cs-feedtext"><b>{item.name}</b> {verb} <b>{item.titleName}</b></div>
+        <div className="cs-feedtext">
+          <button className="cs-feednamebtn" onClick={who} disabled={!onOpenUser}>{item.name}</button>
+          {" "}{verb}{" "}<b>{item.titleName}</b>
+        </div>
         <div className="cs-feedtime">{timeAgo(item.createdAt)}</div>
       </div>
       <Poster title={item.titleName} poster={item.poster} className="sm" />
@@ -700,9 +748,162 @@ function timeAgo(ts) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Public profile — someone else's, opened from Feed or a follow list */
+/* ------------------------------------------------------------------ */
+function UserProfile({ uid, name, photo, myUid, onClose, onOpenFollowList, onOpenUser }) {
+  const isSelf = uid === myUid;
+  const [counts, setCounts] = useState({ following: null, followers: null });
+  const [following, setFollowing] = useState(null); // null = unknown yet, else boolean
+  const [activity, setActivity] = useState([]);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const followsCol = collection(db, "follows");
+        const [followingSnap, followersSnap, meFollowsDoc, activitySnap] = await Promise.all([
+          getCountFromServer(query(followsCol, where("followerUid", "==", uid))),
+          getCountFromServer(query(followsCol, where("followeeUid", "==", uid))),
+          isSelf ? Promise.resolve(null) : getDoc(doc(db, "follows", `${myUid}_${uid}`)),
+          getDocs(query(collection(db, "activity"), where("uid", "==", uid), orderBy("createdAt", "desc"), limit(20))),
+        ]);
+        if (cancelled) return;
+        setCounts({ following: followingSnap.data().count, followers: followersSnap.data().count });
+        if (!isSelf) setFollowing(meFollowsDoc.exists());
+        setActivity(activitySnap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      } catch { /* leave dashes / empty on failure */ }
+      if (!cancelled) setReady(true);
+    })();
+    return () => { cancelled = true; };
+  }, [uid]);
+
+  const toggleFollow = async () => {
+    const ref = doc(db, "follows", `${myUid}_${uid}`);
+    try {
+      if (following) {
+        await deleteDoc(ref);
+        setFollowing(false);
+        setCounts((c) => ({ ...c, followers: Math.max(0, (c.followers || 1) - 1) }));
+      } else {
+        await setDoc(ref, { followerUid: myUid, followeeUid: uid, createdAt: Date.now() });
+        setFollowing(true);
+        setCounts((c) => ({ ...c, followers: (c.followers || 0) + 1 }));
+      }
+    } catch { /* rules not deployed yet, or offline — button just stays as-is */ }
+  };
+
+  return (
+    <div className="cs-modal" onClick={onClose}>
+      <div className="cs-sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="cs-grab" />
+        <button className="cs-close" onClick={onClose}><X size={20} /></button>
+
+        <div className="cs-pid" style={{ padding: "6px 0 18px" }}>
+          {photo
+            ? <img className="cs-avatar" src={photo} alt="" referrerPolicy="no-referrer" />
+            : <div className="cs-avatar">{(name || "?").slice(0, 1).toUpperCase()}</div>}
+          <div className="cs-uname">{name || "Someone"}</div>
+        </div>
+
+        <div className="cs-social">
+          <button className="cs-socell div" onClick={() => onOpenFollowList(uid, "following")}>
+            <b>{counts.following ?? "—"}</b><span>following</span>
+          </button>
+          <button className="cs-socell" onClick={() => onOpenFollowList(uid, "followers")}>
+            <b>{counts.followers ?? "—"}</b><span>followers</span>
+          </button>
+        </div>
+
+        {!isSelf && (
+          <button className={"cs-pill full" + (following ? " active" : "")} style={{ marginTop: 18 }}
+            onClick={toggleFollow} disabled={following === null}>
+            {following ? "Following" : "Follow"}
+          </button>
+        )}
+
+        <div style={{ marginTop: 26 }}>
+          <div className="cs-blabel">Recent activity</div>
+          {!ready && <div className="cs-searchnote">Loading…</div>}
+          {ready && activity.length === 0 && (
+            <div className="cs-rowsub" style={{ padding: "8px 2px" }}>No activity yet.</div>
+          )}
+          {ready && activity.length > 0 && (
+            <div className="cs-feedlist">
+              {activity.map((it) => <FeedRow key={it.id} item={it} onOpenUser={onOpenUser} />)}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Follow / follower list                                             */
+/* ------------------------------------------------------------------ */
+function FollowList({ uid, mode, myUid, onClose, onOpenUser }) {
+  const [people, setPeople] = useState([]);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const field = mode === "following" ? "followerUid" : "followeeUid";
+        const otherField = mode === "following" ? "followeeUid" : "followerUid";
+        const snap = await getDocs(query(collection(db, "follows"), where(field, "==", uid)));
+        const otherUids = snap.docs.map((d) => d.data()[otherField]);
+        const profiles = await Promise.all(otherUids.map(async (ouid) => {
+          try {
+            const udoc = await getDoc(doc(db, "users", ouid));
+            return udoc.exists() ? { uid: ouid, ...udoc.data() } : { uid: ouid, name: "Someone" };
+          } catch { return { uid: ouid, name: "Someone" }; }
+        }));
+        if (!cancelled) setPeople(profiles);
+      } catch { if (!cancelled) setPeople([]); }
+      if (!cancelled) setReady(true);
+    })();
+    return () => { cancelled = true; };
+  }, [uid, mode]);
+
+  const head = mode === "following" ? "Following" : "Followers";
+  const emptyHead = mode === "following" ? "Not following anyone yet" : "No followers yet";
+  const emptySub = mode === "following" ? "People followed show up here." : "People who follow show up here.";
+
+  return (
+    <div className="cs-modal" onClick={onClose}>
+      <div className="cs-sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="cs-grab" />
+        <button className="cs-close" onClick={onClose}><X size={20} /></button>
+        <div className="cs-dtitle sm">{head}</div>
+
+        {!ready && <div className="cs-searchnote">Loading…</div>}
+        {ready && people.length === 0 && (
+          <Empty icon={<User size={26} />} head={emptyHead} sub={emptySub} />
+        )}
+        {ready && people.length > 0 && (
+          <div className="cs-followlist">
+            {people.map((p) => (
+              <button key={p.uid} className="cs-followrow" onClick={() => onOpenUser(p)}>
+                {p.photo
+                  ? <img className="cs-favatar" src={p.photo} alt="" referrerPolicy="no-referrer" />
+                  : <div className="cs-favatar">{(p.name || "?").slice(0, 1).toUpperCase()}</div>}
+                <span className="cs-followname">{p.name || "Someone"}</span>
+                <ChevronRight size={18} className="cs-dim" />
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /*  Profile  (closely mirrors the reference screen)                    */
 /* ------------------------------------------------------------------ */
-function Profile({ data, user, onOpen, onCreateList, onDeleteList, notify, onSignOut }) {
+function Profile({ data, user, onOpen, onCreateList, onDeleteList, notify, onOpenFollowList, onSignOut }) {
   const [showNew, setShowNew] = useState(false);
   const [menu, setMenu] = useState(false);
   const [name, setName] = useState("");
@@ -728,26 +929,25 @@ function Profile({ data, user, onOpen, onCreateList, onDeleteList, notify, onSig
     onCreateList(n); setName(""); setShowNew(false); notify("List created");
   };
 
-  // Real numbers from the shared activity feed, in place of the old
-  // following/followers/comments placeholders (there's no social graph or
-  // comments feature to back those). Cheap server-side counts, not full
-  // document reads. Left as "—" if the query fails (e.g. activity's
-  // Firestore rules aren't deployed yet) or while still loading.
-  const [community, setCommunity] = useState({ total: null, today: null, yours: null });
+  // Real numbers, in place of the old hardcoded placeholders: how many of
+  // your own status changes are in the shared feed, plus real follow counts
+  // from the follows collection. Cheap server-side counts, not full document
+  // reads. Left as "—" if a query fails (e.g. rules not deployed yet).
+  const [community, setCommunity] = useState({ yours: null, following: null, followers: null });
   useEffect(() => {
     if (!configured || !user) return;
     let cancelled = false;
     (async () => {
       try {
-        const dayAgo = Date.now() - 24 * 3600 * 1000;
         const activityCol = collection(db, "activity");
-        const [totalSnap, todaySnap, yoursSnap] = await Promise.all([
-          getCountFromServer(activityCol),
-          getCountFromServer(query(activityCol, where("createdAt", ">=", dayAgo))),
+        const followsCol = collection(db, "follows");
+        const [yoursSnap, followingSnap, followersSnap] = await Promise.all([
           getCountFromServer(query(activityCol, where("uid", "==", user.uid))),
+          getCountFromServer(query(followsCol, where("followerUid", "==", user.uid))),
+          getCountFromServer(query(followsCol, where("followeeUid", "==", user.uid))),
         ]);
         if (cancelled) return;
-        setCommunity({ total: totalSnap.data().count, today: todaySnap.data().count, yours: yoursSnap.data().count });
+        setCommunity({ yours: yoursSnap.data().count, following: followingSnap.data().count, followers: followersSnap.data().count });
       } catch { /* leave as dashes */ }
     })();
     return () => { cancelled = true; };
@@ -780,12 +980,13 @@ function Profile({ data, user, onOpen, onCreateList, onDeleteList, notify, onSig
       </div>
 
       <div className="cs-social">
-        {[["updates", community.total], ["today", community.today], ["yours", community.yours]]
-          .map(([label, n], i) => (
-            <div key={label} className={"cs-socell" + (i < 2 ? " div" : "")}>
-              <b>{n ?? "—"}</b><span>{label}</span>
-            </div>
-          ))}
+        <div className="cs-socell div"><b>{community.yours ?? "—"}</b><span>yours</span></div>
+        <button className="cs-socell div" onClick={() => onOpenFollowList("following")}>
+          <b>{community.following ?? "—"}</b><span>following</span>
+        </button>
+        <button className="cs-socell" onClick={() => onOpenFollowList("followers")}>
+          <b>{community.followers ?? "—"}</b><span>followers</span>
+        </button>
       </div>
 
       <section className="cs-sec">
@@ -1236,10 +1437,21 @@ const CSS = `
 .cs-feedrow{ display:flex; align-items:center; gap:12px; background:var(--card); border-radius:16px; padding:12px; }
 .cs-favatar{ flex:0 0 38px; width:38px; height:38px; border-radius:50%; background:var(--card2);
   display:flex; align-items:center; justify-content:center; font-size:15px; font-weight:700; color:var(--acc); object-fit:cover; }
+.cs-feedavatarbtn{ flex:0 0 auto; background:none; border:none; padding:0; cursor:pointer; display:flex; }
+.cs-feedavatarbtn:disabled{ cursor:default; }
 .cs-feedmeta{ flex:1; min-width:0; }
 .cs-feedtext{ font-size:13.5px; line-height:1.4; color:var(--txt); }
 .cs-feedtext b{ font-weight:600; }
+.cs-feednamebtn{ background:none; border:none; padding:0; margin:0; color:inherit; font:inherit; font-weight:600; cursor:pointer; }
+.cs-feednamebtn:disabled{ cursor:default; }
 .cs-feedtime{ font-size:11.5px; color:var(--mut); margin-top:3px; }
+
+/* follow / follower list */
+.cs-followlist{ display:flex; flex-direction:column; margin-top:6px; }
+.cs-followrow{ display:flex; align-items:center; gap:13px; width:100%; text-align:left; background:none; border:none;
+  color:var(--txt); padding:12px 2px; font-size:15px; font-family:inherit; cursor:pointer; border-bottom:1px solid var(--line); }
+.cs-followrow:last-child{ border-bottom:none; }
+.cs-followname{ flex:1; font-weight:600; }
 
 /* empty */
 .cs-empty{ text-align:center; padding:48px 24px; }
@@ -1254,6 +1466,7 @@ const CSS = `
 .cs-pill.sm{ padding:8px 16px; font-size:13px; }
 .cs-pill.full{ flex:1; text-align:center; padding:12px 8px; }
 .cs-pill.active{ background:var(--acc); color:#000; border-color:var(--acc); }
+.cs-pill:disabled{ opacity:.5; cursor:default; }
 
 /* profile */
 .cs-profile{ padding-bottom:24px; }
@@ -1264,7 +1477,8 @@ const CSS = `
 .cs-uname{ font-size:18px; font-weight:700; }
 .cs-usub{ font-size:12.5px; color:var(--mut); margin-top:1px; }
 .cs-social{ display:flex; border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
-.cs-socell{ flex:1; text-align:center; padding:16px 4px; }
+.cs-socell{ flex:1; text-align:center; padding:16px 4px; background:none; border:none; color:inherit; font-family:inherit; cursor:default; }
+button.cs-socell{ cursor:pointer; }
 .cs-socell.div{ border-right:1px solid var(--line); }
 .cs-socell b{ display:block; font-size:20px; font-weight:700; }
 .cs-socell span{ font-size:13px; color:var(--mut); }

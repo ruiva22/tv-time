@@ -18,7 +18,8 @@ In the [Firebase console](https://console.firebase.google.com):
 4. Paste your config into `src/firebase.js` (replace the `YOUR_...` placeholders).
 
 Set these Firestore security rules — each person can only read and write their own
-library, but everyone signed in can read (and post to) the shared `activity` feed:
+library, but everyone signed in can read the shared `activity` feed and `users`
+directory, and follow/unfollow other users:
 
 ```
 rules_version = '2';
@@ -37,6 +38,21 @@ service cloud.firestore {
            )
         && request.resource.data.action in ['want', 'watching', 'watched'];
       allow update, delete: if false;
+    }
+
+    match /users/{uid} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    match /follows/{id} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.followerUid == request.auth.uid
+        && request.resource.data.followeeUid != request.auth.uid
+        && request.resource.data.keys().hasAll(['followerUid', 'followeeUid', 'createdAt']);
+      allow delete: if request.auth != null && resource.data.followerUid == request.auth.uid;
+      allow update: if false;
     }
   }
 }
@@ -89,6 +105,13 @@ Sign-in automatically. `firebase.json` already serves `dist/` as a single-page a
   one event is appended to the shared `activity` collection. All signed-in users
   subscribe to the same live query (newest 50 first), so it's a real-time feed across
   everyone's library, not just your own.
+- Tapping a name/avatar (in the feed, or in a follow list) opens that person's public
+  profile: their follower/following counts and recent activity, plus a Follow button.
+  Following writes one doc to `follows/{followerUid}_{followeeUid}`; unfollowing
+  deletes it. The Profile tab's "following"/"followers" counts open the same list.
+- Every signed-in user also gets a `users/{uid}` directory entry (name + photo, kept
+  up to date on sign-in) so anyone who follows them can show a name, even before
+  they've posted any activity.
 
 ## Project structure
 

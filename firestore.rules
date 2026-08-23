@@ -20,5 +20,27 @@ service cloud.firestore {
         && request.resource.data.action in ['want', 'watching', 'watched'];
       allow update, delete: if false;
     }
+
+    // Public directory entry (name + photo only) for each signed-in user —
+    // lets anyone resolve a uid to a display name for the feed, follow
+    // lists, and profiles. Only the user themselves can write their own.
+    match /users/{uid} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // Follow relationships, one doc per (follower, followee) pair, id
+    // "{followerUid}_{followeeUid}". Anyone signed in can read (to compute
+    // counts and lists); you can only create a follow as yourself, can't
+    // follow yourself, and can only delete (unfollow) your own edges.
+    match /follows/{id} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.followerUid == request.auth.uid
+        && request.resource.data.followeeUid != request.auth.uid
+        && request.resource.data.keys().hasAll(['followerUid', 'followeeUid', 'createdAt']);
+      allow delete: if request.auth != null && resource.data.followerUid == request.auth.uid;
+      allow update: if false;
+    }
   }
 }
