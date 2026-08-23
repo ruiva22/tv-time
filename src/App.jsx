@@ -191,6 +191,58 @@ export default function App() {
     setDoc(doc(db, "trackers", user.uid), data).catch(() => {});
   }, [data, ready, user]);
 
+  // New-season detection: once per session, right after the library loads,
+  // re-check every finished (status "watched") show with a real TMDB id.
+  // If TMDB now has a next_episode_to_air beyond the season count we knew
+  // about, the show is back — move it to Watching (past progress stays as
+  // it was) and flag it so the library row can call it out until opened.
+  useEffect(() => {
+    if (!ready || !user) return;
+    let cancelled = false;
+    (async () => {
+      const finishedShowIds = Object.entries(data.tracking)
+        .filter(([id, e]) => e.status === "watched" && /^\d+$/.test(String(id)))
+        .map(([id]) => id);
+      for (const id of finishedShowIds) {
+        if (cancelled) return;
+        try {
+          const res = await fetch(`/api/title/show/${id}`);
+          if (!res.ok) continue;
+          const full = await res.json();
+          const next = full.nextEpisodeToAir;
+          const knownSeasons = resolveTitle(id, data)?.seasons || 0;
+          if (next && next.season > knownSeasons) {
+            setData((d) => {
+              const cur = d.tracking[id];
+              if (!cur || cur.status !== "watched") return d; // already moved elsewhere
+              return {
+                ...d,
+                tracking: { ...d.tracking, [id]: { ...cur, status: "watching", newSeason: true } },
+                titles: { ...d.titles, [id]: { ...resolveTitle(id, d), ...full } },
+              };
+            });
+            notify(`${full.title} is back — Season ${next.season} just started. Moved to Watching.`);
+          } else if (next) {
+            // No season bump, but keep nextEpisodeToAir fresh so an
+            // already-Watching show's "Next episode" line stays accurate.
+            setData((d) => ({ ...d, titles: { ...d.titles, [id]: { ...resolveTitle(id, d), ...full } } }));
+          }
+        } catch { /* skip this show; it's retried next session */ }
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready, user]);
+
+  // Clear the "new season" callout once its show has actually been opened.
+  const clearNewSeason = (id) =>
+    setData((d) => {
+      const cur = d.tracking[id];
+      if (!cur?.newSeason) return d;
+      const { newSeason, ...rest } = cur;
+      return { ...d, tracking: { ...d.tracking, [id]: rest } };
+    });
+
   /* --- mutations --- */
   const setEntry = (id, patch) =>
     setData((d) => {
@@ -351,6 +403,10 @@ export default function App() {
     refreshTitleDetail(card);
   };
 
+  // Open an already-tracked title by id, dismissing its "new season" callout
+  // (if any) now that it's actually been looked at.
+  const openTitleId = (id) => { clearNewSeason(id); setOpenId(id); };
+
   if (!configured) return <Gate><Setup /></Gate>;
   if (!authReady) return <div className="cs-root cs-boot"><style>{CSS}</style>Loading…</div>;
   if (!user) return <Gate><SignIn onSignIn={() => signIn().catch(() => notify("Sign-in failed — try again", "err"))} /></Gate>;
@@ -364,15 +420,15 @@ export default function App() {
 
       <div className="cs-screen">
         {tab === "shows" && (
-          <Library type="show" data={data} onOpen={setOpenId} goExplore={() => setTab("explore")} />
+          <Library type="show" data={data} onOpen={openTitleId} goExplore={() => setTab("explore")} />
         )}
         {tab === "movies" && (
-          <Library type="movie" data={data} onOpen={setOpenId} goExplore={() => setTab("explore")} />
+          <Library type="movie" data={data} onOpen={openTitleId} goExplore={() => setTab("explore")} />
         )}
         {tab === "feed" && <Feed onOpenUser={openUserProfile} />}
         {tab === "explore" && <Explore data={data} onOpen={setOpenId} onOpenSearch={openSearchResult} />}
         {tab === "profile" && (
-          <Profile data={data} user={user} onOpen={setOpenId} onOpenSearch={openSearchResult}
+          <Profile data={data} user={user} onOpen={openTitleId} onOpenSearch={openSearchResult}
             onCreateList={createList} onDeleteList={deleteList} notify={notify}
             onOpenFollowList={(mode) => setFollowList({ uid: user.uid, mode })}
             onSignOut={() => { logOut(); notify("Signed out"); }} />
@@ -506,9 +562,12 @@ function Library({ type, data, onOpen, goExplore }) {
 function Row({ item, onOpen }) {
   const total = item.episodes || 1;
   const pct = item.type === "show" ? Math.round(((item.progress || 0) / total) * 100) : null;
+  const nextAir = item.nextEpisodeToAir?.airDate;
   return (
     <button className="cs-row" onClick={onOpen}>
-      <Poster title={item.title} poster={item.poster} className="sm" />
+      <Poster title={item.title} poster={item.poster} className="sm">
+        {item.newSeason && <div className="cs-newseasonpill">New</div>}
+      </Poster>
       <div className="cs-rowmeta">
         <div className="cs-rowtitle">{item.title}</div>
         <div className="cs-rowsub">{item.genre} · {item.year}</div>
@@ -518,6 +577,7 @@ function Row({ item, onOpen }) {
             <span>{item.progress || 0}/{total}</span>
           </div>
         )}
+        {nextAir && <div className="cs-nextep">▸ Next episode {formatShortDate(nextAir)}</div>}
         {item.rating > 0 && (
           <div className="cs-stars sm">
             {[1, 2, 3, 4, 5].map((s) => (
@@ -745,6 +805,14 @@ function timeAgo(ts) {
   const h = Math.floor(m / 60);
   if (h < 24) return h + "h ago";
   return Math.floor(h / 24) + "d ago";
+}
+
+// "2026-03-12" -> "Mar 12" — used for upcoming/next-episode air dates.
+function formatShortDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso + "T00:00:00");
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1272,8 +1340,16 @@ function Episodes({ title, entry, onClose, onToggle, onToggleSeason }) {
   const watched = entry?.eps || {};
   const watchedCount = Object.keys(watched).length;
   const total = seasons.reduce((a, s) => a + (s.episodeCount || 0), 0) || title.episodes || 1;
-  const seasonNums = eps.map((e) => e.number);
-  const seasonAllWatched = eps.length > 0 && seasonNums.every((n) => watched[`${season}-${n}`]);
+
+  // Split out episodes that haven't aired yet (or have no date at all —
+  // TMDB often lists a placeholder episode before a date is announced).
+  // Only released episodes count toward "mark season watched" / progress —
+  // there's nothing to mark on one that hasn't aired.
+  const todayISO = new Date().toISOString().slice(0, 10);
+  const released = eps.filter((e) => e.airDate && e.airDate <= todayISO);
+  const upcoming = eps.filter((e) => !e.airDate || e.airDate > todayISO);
+  const seasonNums = released.map((e) => e.number);
+  const seasonAllWatched = released.length > 0 && seasonNums.every((n) => watched[`${season}-${n}`]);
 
   return (
     <div className="cs-modal" onClick={onClose}>
@@ -1300,7 +1376,7 @@ function Episodes({ title, entry, onClose, onToggle, onToggleSeason }) {
           ) : (
             <div className="cs-seasonlabel">{seasons[0]?.name || "Season 1"}</div>
           )}
-          {status === "done" && eps.length > 0 && (
+          {status === "done" && released.length > 0 && (
             <button className="cs-pill sm" onClick={() => onToggleSeason(season, seasonNums, !seasonAllWatched)}>
               {seasonAllWatched ? "Unmark season" : "Mark season watched"}
             </button>
@@ -1312,7 +1388,7 @@ function Episodes({ title, entry, onClose, onToggle, onToggleSeason }) {
 
         {status === "done" && (
           <div className="cs-eplist">
-            {eps.map((e) => {
+            {released.map((e) => {
               const key = `${season}-${e.number}`;
               const on = !!watched[key];
               return (
@@ -1337,6 +1413,27 @@ function Episodes({ title, entry, onClose, onToggle, onToggleSeason }) {
                 </button>
               );
             })}
+
+            {upcoming.length > 0 && (
+              <>
+                <div className="cs-epsechd">Upcoming</div>
+                {upcoming.map((e) => (
+                  <div key={`${season}-${e.number}`} className="cs-eprow upcoming">
+                    <div className="cs-epimg">
+                      {e.still ? <img src={e.still} alt="" loading="lazy" /> : <div className="cs-epimg-ph" />}
+                    </div>
+                    <div className="cs-epmeta">
+                      <div className="cs-eptop">
+                        <span className="cs-epnum">{e.number}.</span>
+                        <span className="cs-epname">{e.name}</span>
+                      </div>
+                      <div className="cs-epfoot"><span>Not yet aired</span></div>
+                    </div>
+                    <span className="cs-epairdate">{e.airDate ? formatShortDate(e.airDate) : "TBA"}</span>
+                  </div>
+                ))}
+              </>
+            )}
           </div>
         )}
       </div>
@@ -1488,6 +1585,9 @@ const CSS = `
 .cs-progbar i{ display:block; height:100%; background:var(--acc); border-radius:3px; }
 .cs-progbar.big{ height:6px; margin-top:12px; }
 .cs-prog span{ font-size:11px; color:var(--mut); font-variant-numeric:tabular-nums; }
+.cs-nextep{ font-size:11.5px; color:#FFD426; margin-top:6px; }
+.cs-newseasonpill{ position:absolute; top:4px; left:4px; background:var(--acc); color:#3a2e00; font-size:8.5px;
+  font-weight:700; letter-spacing:.02em; text-transform:uppercase; padding:2px 5px; border-radius:99px; white-space:nowrap; }
 .cs-stars{ display:flex; gap:3px; }
 .cs-stars.sm{ margin-top:6px; }
 
@@ -1681,6 +1781,9 @@ button.cs-socell{ cursor:pointer; }
 .cs-eprow{ display:flex; align-items:flex-start; gap:12px; width:100%; text-align:left;
   background:var(--card); border:none; border-radius:14px; padding:10px; cursor:pointer; font-family:inherit; color:var(--txt); }
 .cs-eprow.on{ background:#20240f; }
+.cs-eprow.upcoming{ background:#161615; opacity:.7; cursor:default; }
+.cs-epsechd{ font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--mut); margin:4px 2px 0; }
+.cs-epairdate{ flex:0 0 auto; font-size:11px; font-weight:600; color:#FFD426; white-space:nowrap; align-self:center; }
 .cs-epimg{ flex:0 0 100px; width:100px; height:60px; border-radius:9px; overflow:hidden; background:var(--card2); }
 .cs-epimg img{ width:100%; height:100%; object-fit:cover; display:block; }
 .cs-epimg-ph{ width:100%; height:100%; background:var(--card2); }

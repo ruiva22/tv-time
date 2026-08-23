@@ -99,6 +99,15 @@ app.get("/api/title/:type/:id", async (req, res) => {
             name: s.name,
             episodeCount: s.episode_count || 0,
           })),
+        // The next known-but-unaired episode, if TMDB has one scheduled —
+        // powers "new season released" detection and the "Next episode"
+        // line, without any extra request.
+        nextEpisodeToAir: r.next_episode_to_air ? {
+          airDate: r.next_episode_to_air.air_date || null,
+          season: r.next_episode_to_air.season_number,
+          episode: r.next_episode_to_air.episode_number,
+          name: r.next_episode_to_air.name || null,
+        } : null,
       });
     } else {
       res.json({ ...card, genre, runtime: r.runtime || 0 });

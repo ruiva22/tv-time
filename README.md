@@ -117,6 +117,13 @@ Sign-in automatically. `firebase.json` already serves `dist/` as a single-page a
   breakdown with a "favorite genre" callout. **Recommended for you** is the one
   exception — it asks TMDB for popular titles in your top genre (via a genre-name ->
   TMDB-genre-id table in `server.js`) and filters out anything you already track.
+- Once per session, right after your library loads, finished (Watched) shows with a
+  real TMDB id get quietly re-checked against TMDB's `next_episode_to_air`. If a new
+  season has started, the show moves back to Watching (past progress is untouched), a
+  toast announces it, and its row gets a "New" pill plus a "Next episode <date>" line
+  until you open it. The episode picker also splits any season's episodes into
+  released (as before) and a dimmed "Upcoming" group for ones with no air date yet or
+  a future one — nothing to mark watched there, so no checkbox.
 
 ## Project structure
 
