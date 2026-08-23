@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
-  Tv, Clapperboard, Search, User, Bell, MoreHorizontal, ChevronRight,
+  Tv, Clapperboard, Search, User, Bell, MoreHorizontal, ChevronRight, ChevronDown,
   Star, Plus, Minus, Check, X, Clock, ListPlus, Trash2, Film, ArrowLeft,
 } from "lucide-react";
 import { db, configured, signIn, logOut, watchAuth } from "./firebase";
@@ -100,8 +100,11 @@ function Poster({ title, poster, className = "", children }) {
 /* ------------------------------------------------------------------ */
 const KEY = "cs_tracker_v1";
 const defaultData = {
-  tracking: {},            // id -> { status, rating, progress, addedAt, watchedAt }
-  titles: {},              // id -> { id, title, type, year, genre, poster, seasons, episodes, runtime }  (snapshots for searched titles)
+  tracking: {},            // id -> { status, rating, progress, addedAt, watchedAt, eps }
+                            //   eps: { "season-episode" -> true } per-episode watched marks
+                            //   (only populated for titles with a real TMDB id; progress is
+                            //   kept in sync as eps.length so old UI reading it still works)
+  titles: {},              // id -> { id, title, type, year, genre, poster, seasons, episodes, runtime, seasonList }  (snapshots for searched titles)
   lists: [],               // { id, name, itemIds: [] }
   profile: { username: "you", following: 42, followers: 128, comments: 17 },
 };
@@ -114,6 +117,7 @@ export default function App() {
   const [data, setData] = useState(defaultData);
   const [ready, setReady] = useState(false);
   const [openId, setOpenId] = useState(null);       // detail sheet
+  const [showEpisodes, setShowEpisodes] = useState(false); // episode picker over the detail sheet
   const [toast, setToast] = useState(null);         // { text, kind }
   const [listPick, setListPick] = useState(null);   // id being added to a list
   const [user, setUser] = useState(null);           // signed-in Google user
@@ -223,6 +227,60 @@ export default function App() {
     setEntry(id, patch);
   };
 
+  // Toggle a single episode's watched mark and keep progress/status in sync.
+  const toggleEpisode = (id, season, ep) =>
+    setData((d) => {
+      const cur = d.tracking[id] || {};
+      const eps = { ...(cur.eps || {}) };
+      const key = `${season}-${ep}`;
+      if (eps[key]) delete eps[key]; else eps[key] = true;
+      const patch = applyEpsPatch(d, id, cur, eps);
+      return { ...d, tracking: { ...d.tracking, [id]: { ...cur, ...patch } } };
+    });
+
+  // Mark (or unmark) every episode of one season at once.
+  const setSeasonWatched = (id, season, epNumbers, watched) =>
+    setData((d) => {
+      const cur = d.tracking[id] || {};
+      const eps = { ...(cur.eps || {}) };
+      for (const n of epNumbers) {
+        const key = `${season}-${n}`;
+        if (watched) eps[key] = true; else delete eps[key];
+      }
+      const patch = applyEpsPatch(d, id, cur, eps);
+      return { ...d, tracking: { ...d.tracking, [id]: { ...cur, ...patch } } };
+    });
+
+  // Shared bookkeeping for both episode mutators above: recompute progress
+  // from how many episodes are marked, and derive status/watchedAt from that.
+  function applyEpsPatch(d, id, cur, eps) {
+    const title = resolveTitle(id, d);
+    const total = title?.episodes || 1;
+    const count = Object.keys(eps).length;
+    const patch = {
+      eps,
+      progress: count,
+      status: count >= total ? "watched" : count > 0 ? "watching" : cur.status || "want",
+      addedAt: cur.addedAt || Date.now(),
+    };
+    const watchedAt = count >= total ? Date.now() : cur.watchedAt;
+    if (watchedAt) patch.watchedAt = watchedAt;
+    return patch;
+  }
+
+  // Fetch (or refresh) a title's full TMDB detail — genre, counts, seasonList
+  // — and snapshot it. Used both when adding a searched title and to backfill
+  // seasonList on titles saved before that field existed.
+  const refreshTitleDetail = async (t) => {
+    try {
+      const res = await fetch(`/api/title/${t.type}/${t.id}`);
+      if (res.ok) {
+        const full = await res.json();
+        setData((d) => ({ ...d, titles: { ...d.titles, [full.id]: { ...t, ...full } } }));
+      }
+    } catch { /* keep whatever snapshot we already have */ }
+  };
+
   const createList = (name) =>
     setData((d) => ({ ...d, lists: [...d.lists, { id: "l_" + Date.now(), name, itemIds: [] }] }));
   const deleteList = (lid) =>
@@ -246,13 +304,7 @@ export default function App() {
     // Snapshot the light card immediately so the sheet can render at once.
     saveTitleSnapshot(card);
     setOpenId(card.id);
-    try {
-      const res = await fetch(`/api/title/${card.type}/${card.id}`);
-      if (res.ok) {
-        const full = await res.json();
-        setData((d) => ({ ...d, titles: { ...d.titles, [full.id]: { ...card, ...full } } }));
-      }
-    } catch { /* keep the light snapshot if detail fetch fails */ }
+    refreshTitleDetail(card);
   };
 
   if (!configured) return <Gate><Setup /></Gate>;
@@ -306,12 +358,23 @@ export default function App() {
       {openTitle && (
         <Detail
           title={openTitle} entry={data.tracking[openTitle.id]} lists={data.lists}
-          onClose={() => setOpenId(null)}
+          onClose={() => { setOpenId(null); setShowEpisodes(false); }}
           onTrack={(s) => track(openTitle.id, s)}
           onUntrack={() => { untrack(openTitle.id); setOpenId(null); notify("Removed from your library"); }}
           onRate={(r) => rate(openTitle.id, r)}
           onProgress={(v) => setProgress(openTitle.id, v)}
           onOpenListPick={() => setListPick(openTitle.id)}
+          onOpenEpisodes={() => setShowEpisodes(true)}
+          onRefreshTitle={refreshTitleDetail}
+        />
+      )}
+
+      {showEpisodes && openTitle && (
+        <Episodes
+          title={openTitle} entry={data.tracking[openTitle.id]}
+          onClose={() => setShowEpisodes(false)}
+          onToggle={(season, ep) => toggleEpisode(openTitle.id, season, ep)}
+          onToggleSeason={(season, nums, watched) => setSeasonWatched(openTitle.id, season, nums, watched)}
         />
       )}
 
@@ -607,9 +670,23 @@ const Stat = ({ n, l }) => (<div className="cs-stat"><b>{n}</b><span>{l}</span><
 /* ------------------------------------------------------------------ */
 /*  Detail sheet                                                       */
 /* ------------------------------------------------------------------ */
-function Detail({ title, entry, lists, onClose, onTrack, onUntrack, onRate, onProgress, onOpenListPick }) {
-  const total = title.episodes || 1;
+function Detail({ title, entry, lists, onClose, onTrack, onUntrack, onRate, onProgress, onOpenListPick, onOpenEpisodes, onRefreshTitle }) {
+  // Prefer the season-list sum (excludes specials) so this matches the
+  // episode picker's total exactly; fall back to the flat episode count.
+  const total = title.seasonList?.length
+    ? title.seasonList.reduce((a, s) => a + (s.episodeCount || 0), 0) || title.episodes || 1
+    : title.episodes || 1;
   const inList = lists.some((l) => l.itemIds.includes(title.id));
+  // Only titles added via search carry a real numeric TMDB id — that's what
+  // lets us fetch a per-episode list. Seed/demo titles fall back to the
+  // plain +/- stepper below.
+  const hasTmdbId = title.type === "show" && /^\d+$/.test(String(title.id));
+
+  // Snapshots saved before seasonList existed won't have it yet — backfill
+  // once so the episode picker knows how episodes split across seasons.
+  useEffect(() => {
+    if (hasTmdbId && !title.seasonList) onRefreshTitle(title);
+  }, [hasTmdbId, title.id, title.seasonList]);
   return (
     <div className="cs-modal" onClick={onClose}>
       <div className="cs-sheet" onClick={(e) => e.stopPropagation()}>
@@ -657,7 +734,17 @@ function Detail({ title, entry, lists, onClose, onTrack, onUntrack, onRate, onPr
         </div>
 
         {/* progress (shows only) */}
-        {title.type === "show" && (
+        {title.type === "show" && hasTmdbId && (
+          <div className="cs-block">
+            <div className="cs-blabel">Episodes watched</div>
+            <div className="cs-progbar big"><i style={{ width: ((entry?.progress || 0) / total) * 100 + "%" }} /></div>
+            <button className="cs-line cs-epbtn" onClick={onOpenEpisodes}>
+              <span>{entry?.progress || 0} of {total} · pick which episodes</span>
+              <ChevronRight size={19} />
+            </button>
+          </div>
+        )}
+        {title.type === "show" && !hasTmdbId && (
           <div className="cs-block">
             <div className="cs-blabel">Episodes watched</div>
             <div className="cs-stepper">
@@ -682,6 +769,106 @@ function Detail({ title, entry, lists, onClose, onTrack, onUntrack, onRate, onPr
             </button>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Episode picker — per-episode watched marks with image/desc/rating */
+/* ------------------------------------------------------------------ */
+function Episodes({ title, entry, onClose, onToggle, onToggleSeason }) {
+  const seasons = title.seasonList?.length
+    ? title.seasonList
+    : [{ number: 1, name: "Season 1", episodeCount: title.episodes || 0 }];
+  const [season, setSeason] = useState(seasons[0]?.number || 1);
+  const [eps, setEps] = useState([]);
+  const [status, setStatus] = useState("loading"); // loading | done | error
+
+  useEffect(() => {
+    let cancelled = false;
+    setStatus("loading");
+    fetch(`/api/title/show/${title.id}/season/${season}`)
+      .then((r) => r.json())
+      .then((json) => {
+        if (cancelled) return;
+        if (json.episodes) { setEps(json.episodes); setStatus("done"); }
+        else setStatus("error");
+      })
+      .catch(() => { if (!cancelled) setStatus("error"); });
+    return () => { cancelled = true; };
+  }, [title.id, season]);
+
+  const watched = entry?.eps || {};
+  const watchedCount = Object.keys(watched).length;
+  const total = seasons.reduce((a, s) => a + (s.episodeCount || 0), 0) || title.episodes || 1;
+  const seasonNums = eps.map((e) => e.number);
+  const seasonAllWatched = eps.length > 0 && seasonNums.every((n) => watched[`${season}-${n}`]);
+
+  return (
+    <div className="cs-modal" onClick={onClose}>
+      <div className="cs-sheet tall" onClick={(e) => e.stopPropagation()}>
+        <div className="cs-grab" />
+        <button className="cs-close" onClick={onClose}><X size={20} /></button>
+
+        <div className="cs-dtitle sm">{title.title}</div>
+        <div className="cs-epprogwrap">
+          <div className="cs-progbar big"><i style={{ width: (watchedCount / total) * 100 + "%" }} /></div>
+          <span className="cs-blabel">{watchedCount} of {total} episodes watched</span>
+        </div>
+
+        <div className="cs-seasonrow">
+          {seasons.length > 1 ? (
+            <div className="cs-seasonselect">
+              <select value={season} onChange={(e) => setSeason(Number(e.target.value))}>
+                {seasons.map((s) => (
+                  <option key={s.number} value={s.number}>{s.name || `Season ${s.number}`}</option>
+                ))}
+              </select>
+              <ChevronDown size={16} />
+            </div>
+          ) : (
+            <div className="cs-seasonlabel">{seasons[0]?.name || "Season 1"}</div>
+          )}
+          {status === "done" && eps.length > 0 && (
+            <button className="cs-pill sm" onClick={() => onToggleSeason(season, seasonNums, !seasonAllWatched)}>
+              {seasonAllWatched ? "Unmark season" : "Mark season watched"}
+            </button>
+          )}
+        </div>
+
+        {status === "loading" && <div className="cs-searchnote">Loading episodes…</div>}
+        {status === "error" && <div className="cs-searchnote">Couldn't load episodes — check your connection.</div>}
+
+        {status === "done" && (
+          <div className="cs-eplist">
+            {eps.map((e) => {
+              const key = `${season}-${e.number}`;
+              const on = !!watched[key];
+              return (
+                <button key={key} className={"cs-eprow" + (on ? " on" : "")} onClick={() => onToggle(season, e.number)}>
+                  <div className="cs-epimg">
+                    {e.still ? <img src={e.still} alt="" loading="lazy" /> : <div className="cs-epimg-ph" />}
+                  </div>
+                  <div className="cs-epmeta">
+                    <div className="cs-eptop">
+                      <span className="cs-epnum">{e.number}.</span>
+                      <span className="cs-epname">{e.name}</span>
+                    </div>
+                    {e.overview && <p className="cs-epoverview">{e.overview}</p>}
+                    <div className="cs-epfoot">
+                      {e.rating > 0 && (
+                        <span className="cs-eprating"><Star size={12} fill="#FFD426" color="#FFD426" strokeWidth={1.5} /> {e.rating}</span>
+                      )}
+                      {e.airDate && <span>{e.airDate}</span>}
+                    </div>
+                  </div>
+                  <div className={"cs-check" + (on ? " on" : "")}>{on && <Check size={15} />}</div>
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -922,6 +1109,8 @@ const CSS = `
 .cs-sheet{ width:100%; max-height:90%; overflow-y:auto; background:#141416; border-radius:24px 24px 0 0;
   padding:10px 20px 30px; position:relative; animation:rise .26s cubic-bezier(.2,.8,.2,1); }
 .cs-sheet.short{ padding-bottom:24px; }
+.cs-sheet.tall{ max-height:96%; height:96%; display:flex; flex-direction:column; }
+.cs-sheet.tall .cs-eplist{ flex:1; }
 @keyframes rise{ from{transform:translateY(30px)} to{transform:translateY(0)} }
 .cs-grab{ width:38px; height:4px; border-radius:3px; background:#48484a; margin:2px auto 14px; }
 .cs-close{ position:absolute; top:14px; right:16px; background:var(--card2); border:none; color:var(--txt);
@@ -947,6 +1136,36 @@ const CSS = `
 .cs-line{ display:flex; align-items:center; gap:12px; width:100%; background:none; border:none; color:var(--txt);
   padding:15px 4px; font-size:15px; cursor:pointer; font-family:inherit; border-top:1px solid var(--line); text-align:left; }
 .cs-line.danger{ color:#ff6b6b; }
+.cs-epbtn{ border-top:none; margin-top:12px; justify-content:space-between; background:var(--card); border-radius:14px; padding:13px 14px; color:var(--mut); font-size:13.5px; }
+
+/* episode picker */
+.cs-epprogwrap{ margin:14px 0 4px; }
+.cs-epprogwrap .cs-blabel{ margin:8px 0 0; }
+.cs-seasonrow{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin:14px 0 10px; flex-wrap:wrap; }
+.cs-seasonrow .cs-pill.sm{ flex:0 0 auto; }
+.cs-seasonselect{ position:relative; flex:0 1 auto; min-width:0; display:flex; align-items:center; }
+.cs-seasonselect select{ appearance:none; -webkit-appearance:none; background:var(--card); color:var(--txt);
+  border:1.5px solid rgba(255,255,255,.55); border-radius:999px; padding:8px 34px 8px 16px;
+  font-size:14px; font-weight:600; font-family:inherit; cursor:pointer; max-width:100%; }
+.cs-seasonselect select:focus{ outline:none; }
+.cs-seasonselect svg{ position:absolute; right:12px; pointer-events:none; color:var(--mut); }
+.cs-seasonlabel{ font-size:14px; font-weight:600; color:var(--mut); }
+.cs-eplist{ display:flex; flex-direction:column; gap:10px; padding-bottom:10px; }
+.cs-eprow{ display:flex; align-items:flex-start; gap:12px; width:100%; text-align:left;
+  background:var(--card); border:none; border-radius:14px; padding:10px; cursor:pointer; font-family:inherit; color:var(--txt); }
+.cs-eprow.on{ background:#20240f; }
+.cs-epimg{ flex:0 0 100px; width:100px; height:60px; border-radius:9px; overflow:hidden; background:var(--card2); }
+.cs-epimg img{ width:100%; height:100%; object-fit:cover; display:block; }
+.cs-epimg-ph{ width:100%; height:100%; background:var(--card2); }
+.cs-epmeta{ flex:1; min-width:0; }
+.cs-eptop{ display:flex; gap:6px; align-items:baseline; }
+.cs-epnum{ font-size:13px; color:var(--mut); font-weight:600; flex:0 0 auto; }
+.cs-epname{ font-size:14px; font-weight:600; line-height:1.25; }
+.cs-epoverview{ margin:4px 0 0; font-size:12px; color:var(--mut); line-height:1.4;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.cs-epfoot{ display:flex; gap:10px; margin-top:6px; font-size:11px; color:var(--dim); }
+.cs-eprating{ display:flex; align-items:center; gap:3px; color:var(--mut); }
+.cs-eprow .cs-check{ flex:0 0 auto; margin-top:2px; }
 
 /* list picker */
 .cs-picklist{ margin:12px 0 4px; display:flex; flex-direction:column; }

@@ -12,6 +12,8 @@
 //   GET /api/health          -> { ok, tmdb: bool }
 //   GET /api/search?q=...     -> { results: [ {id,type,title,year,poster,overview} ] }
 //   GET /api/title/:type/:id  -> single title with extra detail (seasons/eps/runtime/genre)
+//   GET /api/title/show/:id/season/:season -> episode list for one season
+//                                              (name/still/overview/airDate/rating)
 
 import express from "express";
 import path from "node:path";
@@ -84,10 +86,39 @@ app.get("/api/title/:type/:id", async (req, res) => {
         ...card, genre,
         seasons: r.number_of_seasons || 1,
         episodes: r.number_of_episodes || 1,
+        // Per-season episode counts, so the client can build an episode
+        // picker without guessing how episodes divide across seasons.
+        seasonList: (r.seasons || [])
+          .filter((s) => s.season_number > 0) // skip "Specials"
+          .map((s) => ({
+            number: s.season_number,
+            name: s.name,
+            episodeCount: s.episode_count || 0,
+          })),
       });
     } else {
       res.json({ ...card, genre, runtime: r.runtime || 0 });
     }
+  } catch (e) {
+    res.status(502).json({ error: String(e.message || e) });
+  }
+});
+
+// One season's episode list — name, still image, overview, air date, rating.
+app.get("/api/title/show/:id/season/:season", async (req, res) => {
+  const { id, season } = req.params;
+  if (!KEY) return res.status(503).json({ error: "TMDB key not configured" });
+  try {
+    const r = await tmdb(`/tv/${id}/season/${season}`);
+    const episodes = (r.episodes || []).map((e) => ({
+      number: e.episode_number,
+      name: e.name || `Episode ${e.episode_number}`,
+      overview: e.overview || "",
+      still: e.still_path ? IMG + e.still_path : null,
+      airDate: e.air_date || null,
+      rating: e.vote_average ? Math.round(e.vote_average * 10) / 10 : null,
+    }));
+    res.json({ season: Number(season), episodes });
   } catch (e) {
     res.status(502).json({ error: String(e.message || e) });
   }
