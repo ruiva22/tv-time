@@ -14,6 +14,10 @@
 //   GET /api/title/:type/:id  -> single title with extra detail (seasons/eps/runtime/genre)
 //   GET /api/title/show/:id/season/:season -> episode list for one season
 //                                              (name/still/overview/airDate/rating)
+//   GET /api/discover?page=N  -> shuffled batch of popular movies+shows, for
+//                                 the Explore tab's infinite poster feed. `page`
+//                                 is just a client-side counter, not a raw TMDB
+//                                 page — see mapping below.
 
 import express from "express";
 import path from "node:path";
@@ -119,6 +123,40 @@ app.get("/api/title/show/:id/season/:season", async (req, res) => {
       rating: e.vote_average ? Math.round(e.vote_average * 10) / 10 : null,
     }));
     res.json({ season: Number(season), episodes });
+  } catch (e) {
+    res.status(502).json({ error: String(e.message || e) });
+  }
+});
+
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// A batch of popular movies + shows for the Explore feed. `page` is an
+// arbitrary counter from the client (it picks a random start on each visit,
+// then increments as the user scrolls) — we spread it across TMDB's discover
+// page range so different counters land on different, still-popular pages,
+// and offset tv from movie so the two don't move in lockstep.
+app.get("/api/discover", async (req, res) => {
+  if (!KEY) return res.status(503).json({ error: "TMDB key not configured" });
+  const n = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const moviePage = ((n - 1) % 500) + 1;
+  const tvPage = ((n - 1 + 250) % 500) + 1;
+  try {
+    const [movies, shows] = await Promise.all([
+      tmdb("/discover/movie", { sort_by: "popularity.desc", page: moviePage, "vote_count.gte": 50 }),
+      tmdb("/discover/tv", { sort_by: "popularity.desc", page: tvPage, "vote_count.gte": 50 }),
+    ]);
+    const cards = [
+      ...(movies.results || []).map((r) => toCard({ ...r, media_type: "movie" })),
+      ...(shows.results || []).map((r) => toCard({ ...r, media_type: "tv" })),
+    ].filter((c) => c.poster); // skip posterless titles — they'd render as bare gradient tiles
+    res.json({ results: shuffle(cards) });
   } catch (e) {
     res.status(502).json({ error: String(e.message || e) });
   }

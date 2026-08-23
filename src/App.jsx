@@ -478,6 +478,50 @@ function Explore({ data, onOpen, onOpenSearch }) {
   const debounce = useRef(null);
   const seq = useRef(0);
 
+  // Discover feed — an endless, shuffled wall of popular titles shown while
+  // the search box is empty. Starts at a random "page" each time Explore
+  // mounts (tab switch or reload), so it looks different every visit, and
+  // grows forward from there as the user scrolls.
+  const [feed, setFeed] = useState([]);
+  const [feedLoading, setFeedLoading] = useState(false);
+  const pageRef = useRef(Math.floor(Math.random() * 450) + 1);
+  const loadingRef = useRef(false);
+  const bodyRef = useRef(null); // .cs-body — used to reach its scrolling ancestor (.cs-screen)
+
+  const loadMoreFeed = async () => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
+    setFeedLoading(true);
+    try {
+      const res = await fetch(`/api/discover?page=${pageRef.current}`);
+      const json = await res.json();
+      pageRef.current += 1;
+      setFeed((f) => [...f, ...(json.results || [])]);
+    } catch { /* this batch silently drops; scrolling further down retries */ }
+    finally { loadingRef.current = false; setFeedLoading(false); }
+  };
+
+  // First batch, once.
+  useEffect(() => { loadMoreFeed(); }, []);
+
+  // Infinite scroll: load the next batch once the user nears the bottom of
+  // the (internally-scrolling) screen. Re-armed whenever the feed — vs.
+  // search results — is what's showing, since .cs-body gets replaced around
+  // a search. Explore renders as a Fragment, so .cs-body's own parent is the
+  // actual scrolling element (.cs-screen, owned by the parent App).
+  useEffect(() => {
+    if (status !== "idle") return;
+    const scrollEl = bodyRef.current?.parentElement;
+    if (!scrollEl) return;
+    const onScroll = () => {
+      const distanceToBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+      if (distanceToBottom < 800) loadMoreFeed();
+    };
+    scrollEl.addEventListener("scroll", onScroll, { passive: true });
+    onScroll(); // covers the case where the first batch doesn't even fill the screen
+    return () => scrollEl.removeEventListener("scroll", onScroll);
+  }, [status]);
+
   // Debounced live search against the backend TMDB proxy.
   useEffect(() => {
     const query = q.trim();
@@ -510,37 +554,52 @@ function Explore({ data, onOpen, onOpenSearch }) {
         {q && <button className="cs-clear" onClick={() => setQ("")}><X size={16} /></button>}
       </div>
 
-      <div className="cs-body">
+      <div className="cs-body" ref={bodyRef}>
         {status === "loading" && <div className="cs-searchnote">Searching…</div>}
         {status === "error" && <div className="cs-searchnote">Search failed — check your connection.</div>}
 
         {status === "done" && results.length > 0 && (
           <div className="cs-grid">
-            {results.map((t) => {
-              // A searched result may already be tracked (by its TMDB id).
-              const tracked = data.tracking[t.id];
-              return (
-                <button key={t.type + t.id} className="cs-gcard" onClick={() => onOpenSearch(t)}>
-                  <Poster title={t.title} poster={t.poster}>
-                    {tracked && <div className="cs-badge">{tracked.status === "watched" ? "✓" : tracked.status === "watching" ? "▸" : "+"}</div>}
-                  </Poster>
-                  <div className="cs-gtitle">{t.title}</div>
-                  <div className="cs-gsub">{t.type === "show" ? "TV" : "Film"}{t.year ? " · " + t.year : ""}</div>
-                </button>
-              );
-            })}
+            {results.map((t) => (
+              <TitleCard key={t.type + t.id} t={t} tracked={data.tracking[t.id]} onOpen={onOpenSearch} />
+            ))}
           </div>
         )}
 
         {status === "done" && results.length === 0 && (
           <Empty icon={<Search size={26} />} head="No matches" sub="Try a different title." />
         )}
+
         {status === "idle" && (
-          <Empty icon={<Search size={26} />} head="Search the full catalogue"
-            sub="Find any show or film and add it to your library." />
+          <>
+            {feed.length === 0 && feedLoading ? (
+              <div className="cs-searchnote">Loading…</div>
+            ) : (
+              <div className="cs-grid">
+                {feed.map((t, i) => (
+                  <TitleCard key={t.type + t.id + "-" + i} t={t} tracked={data.tracking[t.id]} onOpen={onOpenSearch} />
+                ))}
+              </div>
+            )}
+            {feedLoading && feed.length > 0 && (
+              <div className="cs-feedsentinel"><span>Loading more…</span></div>
+            )}
+          </>
         )}
       </div>
     </>
+  );
+}
+
+function TitleCard({ t, tracked, onOpen }) {
+  return (
+    <button className="cs-gcard" onClick={() => onOpen(t)}>
+      <Poster title={t.title} poster={t.poster}>
+        {tracked && <div className="cs-badge">{tracked.status === "watched" ? "✓" : tracked.status === "watching" ? "▸" : "+"}</div>}
+      </Poster>
+      <div className="cs-gtitle">{t.title}</div>
+      <div className="cs-gsub">{t.type === "show" ? "TV" : "Film"}{t.year ? " · " + t.year : ""}</div>
+    </button>
   );
 }
 
@@ -720,6 +779,21 @@ function Detail({ title, entry, lists, onClose, onTrack, onUntrack, onRate, onPr
             onClick={() => onTrack("watched")}>Watched</button>
         </div>
 
+        {/* episode picker — the second most important action after status,
+            so it gets primary-card weight right under the status row rather
+            than a quiet text link buried further down */}
+        {title.type === "show" && hasTmdbId && (
+          <button className="cs-epcta" onClick={onOpenEpisodes}>
+            <div className="cs-epcta-badge"><Tv size={22} /></div>
+            <div className="cs-epcta-body">
+              <div className="cs-epcta-count">{entry?.progress || 0} of {total} episodes watched</div>
+              <div className="cs-progbar big"><i style={{ width: ((entry?.progress || 0) / total) * 100 + "%" }} /></div>
+              <div className="cs-epcta-sub">Tap to pick which episodes</div>
+            </div>
+            <ChevronRight size={20} className="cs-epcta-chev" />
+          </button>
+        )}
+
         {/* rating */}
         <div className="cs-block">
           <div className="cs-blabel">Your rating</div>
@@ -733,17 +807,6 @@ function Detail({ title, entry, lists, onClose, onTrack, onUntrack, onRate, onPr
           </div>
         </div>
 
-        {/* progress (shows only) */}
-        {title.type === "show" && hasTmdbId && (
-          <div className="cs-block">
-            <div className="cs-blabel">Episodes watched</div>
-            <div className="cs-progbar big"><i style={{ width: ((entry?.progress || 0) / total) * 100 + "%" }} /></div>
-            <button className="cs-line cs-epbtn" onClick={onOpenEpisodes}>
-              <span>{entry?.progress || 0} of {total} · pick which episodes</span>
-              <ChevronRight size={19} />
-            </button>
-          </div>
-        )}
         {title.type === "show" && !hasTmdbId && (
           <div className="cs-block">
             <div className="cs-blabel">Episodes watched</div>
@@ -1045,6 +1108,7 @@ const CSS = `
 .cs-gtitle{ font-size:12.5px; font-weight:600; margin-top:7px; line-height:1.25;
   display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
 .cs-gsub{ font-size:11px; color:var(--mut); margin-top:1px; }
+.cs-feedsentinel{ text-align:center; padding:18px 4px 8px; font-size:12.5px; color:var(--mut); }
 
 /* empty */
 .cs-empty{ text-align:center; padding:48px 24px; }
@@ -1136,7 +1200,17 @@ const CSS = `
 .cs-line{ display:flex; align-items:center; gap:12px; width:100%; background:none; border:none; color:var(--txt);
   padding:15px 4px; font-size:15px; cursor:pointer; font-family:inherit; border-top:1px solid var(--line); text-align:left; }
 .cs-line.danger{ color:#ff6b6b; }
-.cs-epbtn{ border-top:none; margin-top:12px; justify-content:space-between; background:var(--card); border-radius:14px; padding:13px 14px; color:var(--mut); font-size:13.5px; }
+
+/* episode-picker CTA — primary-card weight, tinted to pair with the active status pill */
+.cs-epcta{ display:flex; align-items:center; gap:13px; width:100%; text-align:left; margin:20px 0 0;
+  background:#242408; border:1.5px solid #4a4210; border-radius:18px; padding:16px; cursor:pointer; font-family:inherit; color:var(--txt); }
+.cs-epcta-badge{ flex:0 0 44px; width:44px; height:44px; border-radius:50%; background:var(--acc);
+  display:flex; align-items:center; justify-content:center; color:#3a2e00; }
+.cs-epcta-body{ flex:1; min-width:0; }
+.cs-epcta-count{ font-size:16px; font-weight:700; letter-spacing:-.01em; }
+.cs-epcta-body .cs-progbar{ margin-top:9px; }
+.cs-epcta-sub{ font-size:12px; color:#c9c095; margin-top:7px; }
+.cs-epcta-chev{ flex:0 0 auto; color:var(--mut); }
 
 /* episode picker */
 .cs-epprogwrap{ margin:14px 0 4px; }
