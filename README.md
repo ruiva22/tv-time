@@ -8,6 +8,11 @@ Sign in on your phone and your laptop and you'll see the same library on both,
 updating live. An offline cache keeps everything readable without a connection and
 writes back once you're online again.
 
+It's also installable as a PWA — "Add to Home Screen" on iOS, or the install
+prompt/icon Chrome and Android show automatically. `public/manifest.json` and a
+small `public/service-worker.js` back this (see **Project structure** below);
+nothing to configure, it just works once deployed over HTTPS.
+
 ## 1. Create a Firebase project
 
 In the [Firebase console](https://console.firebase.google.com):
@@ -132,8 +137,12 @@ index.html          # app shell (mobile viewport, full-height root)
 firebase.json       # Hosting config -> serves dist/ as an SPA; points at firestore.rules
 firestore.rules     # security rules for trackers/{uid} and the shared activity feed
 .firebaserc         # your Firebase project alias
+public/
+  manifest.json     # PWA metadata (name, icons, standalone display)
+  service-worker.js # network-first cache for the app shell; skips /api/*
+  icon-*.png, apple-touch-icon.png, favicon-*.png
 src/
-  main.jsx          # React entry
+  main.jsx          # React entry; registers the service worker
   App.jsx           # tracker UI, catalog, state, sign-in gate, sync logic
   firebase.js       # Firebase init, auth helpers, Firestore (with offline cache)
 ```
