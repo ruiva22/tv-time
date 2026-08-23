@@ -4,7 +4,9 @@ import {
   Star, Plus, Minus, Check, X, Clock, ListPlus, Trash2, Film, ArrowLeft, Rss,
 } from "lucide-react";
 import { db, configured, signIn, logOut, watchAuth } from "./firebase";
-import { doc, onSnapshot, setDoc, collection, addDoc, query, orderBy, limit } from "firebase/firestore";
+import {
+  doc, onSnapshot, setDoc, collection, addDoc, query, orderBy, limit, where, getCountFromServer,
+} from "firebase/firestore";
 
 /* ------------------------------------------------------------------ */
 /*  Seed catalog                                                       */
@@ -106,7 +108,6 @@ const defaultData = {
                             //   kept in sync as eps.length so old UI reading it still works)
   titles: {},              // id -> { id, title, type, year, genre, poster, seasons, episodes, runtime, seasonList }  (snapshots for searched titles)
   lists: [],               // { id, name, itemIds: [] }
-  profile: { username: "you", following: 42, followers: 128, comments: 17 },
 };
 
 /* ------------------------------------------------------------------ */
@@ -727,6 +728,31 @@ function Profile({ data, user, onOpen, onCreateList, onDeleteList, notify, onSig
     onCreateList(n); setName(""); setShowNew(false); notify("List created");
   };
 
+  // Real numbers from the shared activity feed, in place of the old
+  // following/followers/comments placeholders (there's no social graph or
+  // comments feature to back those). Cheap server-side counts, not full
+  // document reads. Left as "—" if the query fails (e.g. activity's
+  // Firestore rules aren't deployed yet) or while still loading.
+  const [community, setCommunity] = useState({ total: null, today: null, yours: null });
+  useEffect(() => {
+    if (!configured || !user) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const dayAgo = Date.now() - 24 * 3600 * 1000;
+        const activityCol = collection(db, "activity");
+        const [totalSnap, todaySnap, yoursSnap] = await Promise.all([
+          getCountFromServer(activityCol),
+          getCountFromServer(query(activityCol, where("createdAt", ">=", dayAgo))),
+          getCountFromServer(query(activityCol, where("uid", "==", user.uid))),
+        ]);
+        if (cancelled) return;
+        setCommunity({ total: totalSnap.data().count, today: todaySnap.data().count, yours: yoursSnap.data().count });
+      } catch { /* leave as dashes */ }
+    })();
+    return () => { cancelled = true; };
+  }, [user]);
+
   return (
     <div className="cs-profile">
       <div className="cs-phead">
@@ -754,10 +780,10 @@ function Profile({ data, user, onOpen, onCreateList, onDeleteList, notify, onSig
       </div>
 
       <div className="cs-social">
-        {[["following", data.profile.following], ["followers", data.profile.followers], ["comments", data.profile.comments]]
+        {[["updates", community.total], ["today", community.today], ["yours", community.yours]]
           .map(([label, n], i) => (
             <div key={label} className={"cs-socell" + (i < 2 ? " div" : "")}>
-              <b>{n}</b><span>{label}</span>
+              <b>{n ?? "—"}</b><span>{label}</span>
             </div>
           ))}
       </div>
