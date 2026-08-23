@@ -372,8 +372,8 @@ export default function App() {
         {tab === "feed" && <Feed onOpenUser={openUserProfile} />}
         {tab === "explore" && <Explore data={data} onOpen={setOpenId} onOpenSearch={openSearchResult} />}
         {tab === "profile" && (
-          <Profile data={data} user={user} onOpen={setOpenId} onCreateList={createList}
-            onDeleteList={deleteList} notify={notify}
+          <Profile data={data} user={user} onOpen={setOpenId} onOpenSearch={openSearchResult}
+            onCreateList={createList} onDeleteList={deleteList} notify={notify}
             onOpenFollowList={(mode) => setFollowList({ uid: user.uid, mode })}
             onSignOut={() => { logOut(); notify("Signed out"); }} />
         )}
@@ -901,9 +901,33 @@ function FollowList({ uid, mode, myUid, onClose, onOpenUser }) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Shelf — horizontal scroll row of posters (Profile's taste sections) */
+/* ------------------------------------------------------------------ */
+function Shelf({ label, note, sub, items, onOpen, rated }) {
+  if (!items.length) return null;
+  return (
+    <section className="cs-sec">
+      <div className="cs-sechead"><h3>{label}</h3>{note && <span className="cs-shelfnote">{note}</span>}</div>
+      {sub && <div className="cs-shelfsubline">{sub}</div>}
+      <div className="cs-shelf">
+        {items.map((it) => (
+          <button key={it.type + it.id} className="cs-shelfcard" onClick={() => onOpen(it)}>
+            <Poster title={it.title} poster={it.poster} className="shelf">
+              {rated && <div className="cs-ratebadge">★ 5</div>}
+            </Poster>
+            <div className="cs-shelftitle">{it.title}</div>
+            <div className="cs-shelfsub">{it.year || (it.type === "show" ? "TV" : "Film")}</div>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /*  Profile  (closely mirrors the reference screen)                    */
 /* ------------------------------------------------------------------ */
-function Profile({ data, user, onOpen, onCreateList, onDeleteList, notify, onOpenFollowList, onSignOut }) {
+function Profile({ data, user, onOpen, onOpenSearch, onCreateList, onDeleteList, notify, onOpenFollowList, onSignOut }) {
   const [showNew, setShowNew] = useState(false);
   const [menu, setMenu] = useState(false);
   const [name, setName] = useState("");
@@ -928,6 +952,42 @@ function Profile({ data, user, onOpen, onCreateList, onDeleteList, notify, onOpe
     if (!n) return;
     onCreateList(n); setName(""); setShowNew(false); notify("List created");
   };
+
+  // Taste summary: top-rated titles, recently watched, and a genre
+  // breakdown — all derived from data already stored per tracked title, no
+  // extra reads needed.
+  const insights = useMemo(() => {
+    const entries = Object.entries(data.tracking).map(([id, e]) => ({ ...resolveTitle(id, data), ...e }));
+    const watched = entries.filter((e) => e.status === "watched");
+    const topShows = entries.filter((e) => e.type === "show" && e.rating === 5)
+      .sort((a, b) => (b.watchedAt || 0) - (a.watchedAt || 0));
+    const topMovies = entries.filter((e) => e.type === "movie" && e.rating === 5)
+      .sort((a, b) => (b.watchedAt || 0) - (a.watchedAt || 0));
+    const recent = watched.filter((e) => e.watchedAt).sort((a, b) => b.watchedAt - a.watchedAt).slice(0, 5);
+    const genreCounts = {};
+    watched.forEach((e) => { if (e.genre) genreCounts[e.genre] = (genreCounts[e.genre] || 0) + 1; });
+    const genres = Object.entries(genreCounts).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([genre, count]) => ({ genre, count }));
+    return { topShows, topMovies, recent, genres, topGenre: genres[0]?.genre || null };
+  }, [data]);
+
+  // Recommendations: popular titles in your #1 genre, fetched fresh from
+  // TMDB and filtered down to ones you haven't already tracked. Silently
+  // empty (section just doesn't render) if the genre has no TMDB mapping,
+  // TMDB isn't configured, or the request fails.
+  const [recs, setRecs] = useState([]);
+  useEffect(() => {
+    if (!insights.topGenre) { setRecs([]); return; }
+    let cancelled = false;
+    const page = Math.floor(Math.random() * 450) + 1;
+    fetch(`/api/discover?genre=${encodeURIComponent(insights.topGenre)}&page=${page}`)
+      .then((r) => r.json())
+      .then((json) => {
+        if (cancelled) return;
+        setRecs((json.results || []).filter((t) => !data.tracking[t.id]).slice(0, 12));
+      })
+      .catch(() => { if (!cancelled) setRecs([]); });
+    return () => { cancelled = true; };
+  }, [insights.topGenre]);
 
   // Real numbers, in place of the old hardcoded placeholders: how many of
   // your own status changes are in the shared feed, plus real follow counts
@@ -988,6 +1048,31 @@ function Profile({ data, user, onOpen, onCreateList, onDeleteList, notify, onOpe
           <b>{community.followers ?? "—"}</b><span>followers</span>
         </button>
       </div>
+
+      <Shelf label="Top rated shows" note="5 ★ only" items={insights.topShows} onOpen={(it) => onOpen(it.id)} rated />
+      <Shelf label="Top rated movies" note="5 ★ only" items={insights.topMovies} onOpen={(it) => onOpen(it.id)} rated />
+      <Shelf label="Recently watched" note="last 5" items={insights.recent} onOpen={(it) => onOpen(it.id)} />
+
+      {insights.genres.length > 0 && (
+        <section className="cs-sec">
+          <div className="cs-sechead"><h3>Your genres</h3><span className="cs-shelfnote">by titles watched</span></div>
+          <div className="cs-genrelist">
+            {insights.genres.map((g) => (
+              <div key={g.genre} className="cs-genrerow">
+                <span className="cs-genrename">{g.genre}</span>
+                <div className="cs-genrebar"><i style={{ width: (g.count / insights.genres[0].count) * 100 + "%" }} /></div>
+                <span className="cs-genren">{g.count}</span>
+              </div>
+            ))}
+          </div>
+          <div className="cs-genrecallout">
+            Your favorite genre is <b>{insights.topGenre}</b>.
+          </div>
+        </section>
+      )}
+
+      <Shelf label="Recommended for you" sub={insights.topGenre ? `Because you watch a lot of ${insights.topGenre}` : ""}
+        items={recs} onOpen={onOpenSearch} />
 
       <section className="cs-sec">
         <div className="cs-sechead"><h3>Stats</h3><ChevronRight size={22} className="cs-dim" /></div>
@@ -1416,6 +1501,29 @@ const CSS = `
 .cs-searchnote{ padding:24px 4px; text-align:center; color:#8e8e93; font-size:14px; }
 .cs-badge{ position:absolute; top:5px; right:5px; width:20px; height:20px; border-radius:50%;
   background:var(--acc); color:#000; font-size:12px; font-weight:700; display:flex; align-items:center; justify-content:center; }
+.cs-ratebadge{ position:absolute; top:5px; right:5px; background:var(--acc); color:#3a2e00; font-size:9.5px; font-weight:700;
+  padding:2px 6px; border-radius:99px; }
+
+/* profile taste shelves */
+.cs-shelfnote{ font-size:11.5px; color:var(--mut); flex:0 0 auto; margin-left:8px; }
+.cs-shelfsubline{ font-size:11.5px; color:var(--mut); margin:-8px 0 12px; }
+.cs-shelf{ display:flex; gap:10px; overflow-x:auto; padding-bottom:2px; scrollbar-width:none; }
+.cs-shelf::-webkit-scrollbar{ display:none; }
+.cs-shelfcard{ flex:0 0 auto; width:78px; background:none; border:none; padding:0; text-align:left; font-family:inherit; color:var(--txt); cursor:pointer; }
+.cs-poster.shelf{ width:78px; height:110px; flex:0 0 78px; }
+.cs-poster.shelf span{ display:none; }
+.cs-shelftitle{ font-size:11px; font-weight:600; margin-top:6px; line-height:1.25;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.cs-shelfsub{ font-size:10px; color:var(--mut); margin-top:1px; }
+
+.cs-genrelist{ display:flex; flex-direction:column; gap:9px; }
+.cs-genrerow{ display:flex; align-items:center; gap:10px; }
+.cs-genrename{ width:88px; flex:0 0 auto; font-size:12.5px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.cs-genrebar{ flex:1; height:8px; border-radius:5px; background:var(--card); overflow:hidden; }
+.cs-genrebar i{ display:block; height:100%; background:var(--acc); border-radius:5px; }
+.cs-genren{ width:22px; flex:0 0 auto; text-align:right; font-size:11.5px; color:var(--mut); font-variant-numeric:tabular-nums; }
+.cs-genrecallout{ margin-top:12px; background:#242408; border:1.5px solid #4a4210; border-radius:12px; padding:11px 13px; font-size:12px; color:#e8dfa8; }
+.cs-genrecallout b{ color:#FFD426; }
 
 /* explore grid */
 .cs-searchwrap{ display:flex; align-items:center; gap:10px; margin:6px 20px 0; background:var(--card);

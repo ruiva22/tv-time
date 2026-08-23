@@ -137,20 +137,62 @@ function shuffle(arr) {
   return a;
 }
 
-// A batch of popular movies + shows for the Explore feed. `page` is an
-// arbitrary counter from the client (it picks a random start on each visit,
-// then increments as the user scrolls) — we spread it across TMDB's discover
-// page range so different counters land on different, still-popular pages,
-// and offset tv from movie so the two don't move in lockstep.
+// Genre display name -> TMDB genre id, for movies and tv separately (TMDB
+// uses different id spaces, and sometimes different names, for the two).
+// Covers both TMDB's own official names (what a searched/added title's
+// genre field holds) and this app's seed-catalog's casual names, so genre
+// recommendations work for titles from either source.
+const GENRE_IDS = {
+  "Action": { movie: 28, tv: 10759 },
+  "Action & Adventure": { movie: 28, tv: 10759 },
+  "Adventure": { movie: 12, tv: 10759 },
+  "Animation": { movie: 16, tv: 16 },
+  "Comedy": { movie: 35, tv: 35 },
+  "Crime": { movie: 80, tv: 80 },
+  "Documentary": { movie: 99, tv: 99 },
+  "Drama": { movie: 18, tv: 18 },
+  "Family": { movie: 10751, tv: 10751 },
+  "Fantasy": { movie: 14, tv: 10765 },
+  "History": { movie: 36, tv: null },
+  "Horror": { movie: 27, tv: null },
+  "Music": { movie: 10402, tv: null },
+  "Musical": { movie: 10402, tv: null },
+  "Mystery": { movie: 9648, tv: 9648 },
+  "Romance": { movie: 10749, tv: null },
+  "Science Fiction": { movie: 878, tv: 10765 },
+  "Sci-Fi": { movie: 878, tv: 10765 },
+  "Sci-Fi & Fantasy": { movie: 878, tv: 10765 },
+  "Thriller": { movie: 53, tv: null },
+  "War": { movie: 10752, tv: 10768 },
+  "War & Politics": { movie: 10752, tv: 10768 },
+  "Western": { movie: 37, tv: 37 },
+};
+
+// A batch of popular movies + shows for the Explore feed, or (with `genre`)
+// for Profile's "Recommended for you". `page` is an arbitrary counter from
+// the client (it picks a random start, then increments as the user scrolls)
+// — we spread it across TMDB's discover page range so different counters
+// land on different, still-popular pages, and offset tv from movie so the
+// two don't move in lockstep.
 app.get("/api/discover", async (req, res) => {
   if (!KEY) return res.status(503).json({ error: "TMDB key not configured" });
   const n = Math.max(1, parseInt(req.query.page, 10) || 1);
   const moviePage = ((n - 1) % 500) + 1;
   const tvPage = ((n - 1 + 250) % 500) + 1;
+
+  const genreName = (req.query.genre || "").toString();
+  const g = genreName ? GENRE_IDS[genreName] : null;
+  if (genreName && !g) return res.json({ results: [] }); // unmapped genre name — nothing to recommend
+
+  const movieParams = { sort_by: "popularity.desc", page: moviePage, "vote_count.gte": 50 };
+  const tvParams = { sort_by: "popularity.desc", page: tvPage, "vote_count.gte": 50 };
+  if (g?.movie) movieParams.with_genres = g.movie;
+  if (g?.tv) tvParams.with_genres = g.tv;
+
   try {
     const [movies, shows] = await Promise.all([
-      tmdb("/discover/movie", { sort_by: "popularity.desc", page: moviePage, "vote_count.gte": 50 }),
-      tmdb("/discover/tv", { sort_by: "popularity.desc", page: tvPage, "vote_count.gte": 50 }),
+      g && !g.movie ? Promise.resolve({ results: [] }) : tmdb("/discover/movie", movieParams),
+      g && !g.tv ? Promise.resolve({ results: [] }) : tmdb("/discover/tv", tvParams),
     ]);
     const cards = [
       ...(movies.results || []).map((r) => toCard({ ...r, media_type: "movie" })),

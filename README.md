@@ -112,6 +112,11 @@ Sign-in automatically. `firebase.json` already serves `dist/` as a single-page a
 - Every signed-in user also gets a `users/{uid}` directory entry (name + photo, kept
   up to date on sign-in) so anyone who follows them can show a name, even before
   they've posted any activity.
+- Profile also shows a taste summary, all derived from your own tracked titles (no
+  extra reads): 5-star shows, 5-star movies, your last 5 watched, and a genre
+  breakdown with a "favorite genre" callout. **Recommended for you** is the one
+  exception — it asks TMDB for popular titles in your top genre (via a genre-name ->
+  TMDB-genre-id table in `server.js`) and filters out anything you already track.
 
 ## Project structure
 
